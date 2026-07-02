@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-15
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build curl
+      - name: Install macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          brew install meson ninja
+      - name: Verify Apple Silicon runner
+        if: matrix.target == 'macos-arm64'
+        run: test "$(uname -m)" = "arm64"
+      - name: Fetch Memgraph C API header
+        run: |
+          mkdir -p third_party/memgraph/include
+          curl -L https://raw.githubusercontent.com/memgraph/memgraph/v3.11.0/include/mg_procedure.h \
+            -o third_party/memgraph/include/mg_procedure.h
+      - name: Build
+        run: |
+          CC=clang meson setup build-release \
+            --buildtype=release \
+            -Dmemgraph=enabled \
+            -Dmemgraph_include_dir="$PWD/third_party/memgraph/include"
+          ninja -C build-release
+      - name: Package
+        run: sh scripts/package_release.sh build-release ${{ matrix.target }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-kgraph-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

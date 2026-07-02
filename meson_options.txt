@@ -1,0 +1,13 @@
+option(
+  'memgraph',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build the native Memgraph query module when mg_procedure.h is available.'
+)
+
+option(
+  'memgraph_include_dir',
+  type: 'string',
+  value: '',
+  description: 'Directory containing Memgraph mg_procedure.h.'
+)

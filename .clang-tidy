@@ -1,0 +1,27 @@
+Checks: >
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  bugprone-*,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  cert-*,
+  -cert-err33-c,
+  clang-diagnostic-*,
+  concurrency-*,
+  -concurrency-mt-unsafe,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-function-cognitive-complexity,
+  -readability-implicit-bool-conversion
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^(include|src|tests)/.*'
+CheckOptions:
+  - key: readability-identifier-length.MinimumVariableNameLength
+    value: '1'
+  - key: readability-function-size.LineThreshold
+    value: '160'
+  - key: readability-magic-numbers.IgnoredIntegerValues
+    value: '0;1;2;3;4;8;16;32;64'
+  - key: bugprone-easily-swappable-parameters.MinimumLength
+    value: '4'

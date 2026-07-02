@@ -53,3 +53,16 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Meson and coverage output
+build*/
+dist/
+meson-logs/
+meson-private/
+coverage.xml
+*.gcda
+*.gcno
+*.gcov
+
+# Local dependency headers fetched by CI/release jobs
+third_party/

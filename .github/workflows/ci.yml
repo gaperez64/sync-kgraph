@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-format clang-tidy gcovr meson ninja-build valgrind
+      - name: Configure
+        run: CC=clang meson setup build -Dmemgraph=disabled
+      - name: Build
+        run: ninja -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs
+      - name: Valgrind
+        run: sh scripts/valgrind.sh build-valgrind
+      - name: Format
+        run: sh scripts/check-format.sh
+      - name: Clang tidy
+        run: sh scripts/run-clang-tidy.sh build-tidy
+      - name: Coverage
+        run: sh scripts/coverage.sh build-coverage
+      - name: CLI smoke
+        run: ./build/sync-kgraph-cli --example office
+
+  memgraph-module-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy meson ninja-build curl
+      - name: Fetch Memgraph C API header
+        run: |
+          mkdir -p third_party/memgraph/include
+          curl -L https://raw.githubusercontent.com/memgraph/memgraph/v3.11.0/include/mg_procedure.h \
+            -o third_party/memgraph/include/mg_procedure.h
+      - name: Build module
+        run: |
+          CC=clang meson setup build-memgraph \
+            -Dmemgraph=enabled \
+            -Dmemgraph_include_dir="$PWD/third_party/memgraph/include"
+          ninja -C build-memgraph
+      - name: Clang tidy module
+        run: sh scripts/run-clang-tidy.sh build-memgraph-tidy "$PWD/third_party/memgraph/include"
+      - name: Memgraph smoke
+        run: sh scripts/memgraph_smoke.sh build-memgraph

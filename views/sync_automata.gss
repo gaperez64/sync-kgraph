@@ -1,0 +1,41 @@
+@NodeStyle HasLabel(node, "SyncModel") {
+  color: #305f72;
+  size: 18;
+  label: Format("model: {}", Property(node, "model"));
+}
+
+@NodeStyle HasLabel(node, "SyncState") {
+  color: #2f8f83;
+  size: 14;
+  label: Format("{}", Property(node, "state_key"));
+}
+
+@NodeStyle HasLabel(node, "SyncLetter") {
+  color: #c67c2f;
+  size: 12;
+  label: Format("{}", Property(node, "letter"));
+}
+
+@NodeStyle HasLabel(node, "SyncPair") {
+  color: #6f5aa7;
+  size: 10;
+  label: Format("{}|{}", Property(node, "first_key"), Property(node, "second_key"));
+}
+
+@NodeStyle HasLabel(node, "SyncSubset") {
+  color: #8b6f2f;
+  size: 10;
+  label: Format("{}", Property(node, "subset_key"));
+}
+
+@EdgeStyle Type(edge) == "SYNC_TRANS" {
+  color: #444444;
+  width: 2;
+  label: Format("{}", Property(edge, "letter"));
+}
+
+@EdgeStyle Type(edge) == "PAIR_NEXT" || Type(edge) == "PAIR_PRE" {
+  color: #777777;
+  width: 1;
+  label: Format("{}", Property(edge, "letter"));
+}

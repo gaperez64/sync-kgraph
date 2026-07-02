@@ -12,7 +12,14 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang clang-format clang-tidy gcovr meson ninja-build valgrind
+          sudo apt-get install -y clang clang-format clang-tidy gcovr ninja-build python3-venv valgrind
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install 'meson>=1.6'
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+      - name: Tool versions
+        run: |
+          meson --version
+          clang --version
       - name: Configure
         run: CC=clang meson setup build -Dmemgraph=disabled
       - name: Build
@@ -37,7 +44,14 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang clang-tidy meson ninja-build curl
+          sudo apt-get install -y clang clang-tidy ninja-build curl python3-venv
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install 'meson>=1.6'
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+      - name: Tool versions
+        run: |
+          meson --version
+          clang --version
       - name: Fetch Memgraph C API header
         run: |
           mkdir -p third_party/memgraph/include

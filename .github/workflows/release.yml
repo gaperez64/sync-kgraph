@@ -25,11 +25,18 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang meson ninja-build curl
+          sudo apt-get install -y clang ninja-build curl python3-venv
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install 'meson>=1.6'
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
       - name: Install macOS toolchain
         if: runner.os == 'macOS'
         run: |
           brew install meson ninja
+      - name: Tool versions
+        run: |
+          meson --version
+          clang --version
       - name: Verify Apple Silicon runner
         if: matrix.target == 'macos-arm64'
         run: test "$(uname -m)" = "arm64"

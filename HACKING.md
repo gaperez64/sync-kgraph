@@ -32,7 +32,7 @@ The main ownership boundaries are:
 | `include/sync_kgraph/sync.h` | Installed public C API |
 | `src/sync.c` | Automaton construction, validation, and lookup |
 | `src/oracle.c` | Exact pair-oracle construction and restoration |
-| `src/planner.c` | Synchronization, homing, and bounded partition search |
+| `src/planner.c` | Pair heuristics, motion-support BFS, and observation-partition search |
 | `src/dynamic.c` | Pair-witness repair from direct deltas |
 | `src/snapshot.c` | Immutable/shareable prepared state and reverse indexes |
 | `src/snapshot_cache.c` | Thread-safe process LRU keyed by model version |
@@ -97,6 +97,81 @@ The default LRU limit is 512 MiB. `SYNC_KGRAPH_CACHE_MAX_BYTES` accepts a
 decimal byte limit; zero disables retention. Snapshot accounting is
 conservative when topology or chunks are shared, which favors earlier eviction
 over exceeding the configured cap.
+
+## Synchronization Search
+
+`sg_plan_sync` and `sg_plan_sync_from_records` share one implementation.
+Cached Memgraph calls supply snapshot records; uncached calls build an oracle.
+Both first apply the existing pair-merging heuristic. A greedy dead end can
+strand a support even when another word synchronizes the original input, so
+it is not a `NO_PLAN` certificate.
+
+Since v0.5.1, failure to finish the heuristic discards its word and starts an
+exact forward BFS at the original deduplicated support. Vertices are physical
+state sets and edges are deterministic action images. Observations never
+filter these sets. `sg_partition_bfs` remains a separate observation-based
+search for disambiguation and homing.
+
+The subset search uses a query-local FIFO array of canonical bitsets with
+parent/action indices. Exact bitset equality provides a collision-free linear
+visited lookup. Every newly reached support is retained, including moves that
+preserve cardinality. Queue entries are accessed by index across reallocations;
+capacity and allocation arithmetic are checked. Each stored set equals the
+image of the original support under its reconstructed path, and each expanded
+set has every action successor visited or enqueued. Exhausting the reachable
+frontier without a singleton therefore proves absence. No optional pair-based
+negative shortcut or dominance pruning is currently used.
+
+One positive query budget counts accepted greedy witnesses plus non-goal BFS
+vertices expanded. Starting the fallback does not reset that count. A singleton
+or exhausted frontier on the final permitted expansion completes the search;
+pending work at the limit returns `RESOURCE_BOUND`. Reader/model/allocation
+errors propagate as errors. The pair selector distinguishes a missing witness
+from a record-source `SG_ERR_NOT_FOUND` error.
+
+Every successful word goes through `sg_sync_finalize`, which independently
+replays it from the original support. Existing fast-path words and metrics
+retain `PAIR_MERGE`; exact successes report `SUBSET_BFS`. The new enum value
+is appended after `PARTITION_BFS`, preserving previous numeric values. Failed
+outcomes expose no abandoned prefix or plan-derived metrics. Generation,
+expansions, and elapsed time remain available. Query state never changes the
+automaton, prepared records, cache, or generation.
+
+For `n` model states and initial support size `h`, at most
+`R <= sum(j=1..h, binomial(n,j)) <= 2^n - 1` nonempty supports are reachable.
+The greedy phase accepts at most `h-1` strict reductions, so `(h-1)+R`
+expansions and enough memory suffice for a definitive result. Explicit storage
+can be exponential, and linear visited checks add up to quadratic work in
+`R`. This establishes synchronization word-existence completeness with
+sufficient resources, not shortestness of the heuristic or adaptive-policy
+completeness. There is no persisted fallback frontier between calls.
+
+The regression suite includes:
+
+- The seven-state greedy trap: baseline `d83e521` returned `NO_PLAN` with
+  partial word `a` after one expansion. The repaired planner finds `bc` from
+  the original support with `SUBSET_BFS` at total budget 4.
+- A negative companion with all original pairs mergeable: budget 3 is
+  inconclusive, while budget 4 exhausts the frontier and proves `NO_PLAN`.
+- A ten-state model requiring the equal-cardinality first step in `bdc`, and
+  a six-state permutation model that forces queue reallocation.
+- Built, restored, and from-records oracle equivalence; singleton/deduplicated
+  inputs; injected record-source errors before and after a greedy witness;
+  and a homing word that cannot physically synchronize.
+- An independent bitmask BFS over all 729 two-action transition tables on
+  three states and all seven nonempty supports (5,103 instances). Every
+  instance is checked at budgets 1 and 64, with independent word replay.
+- Cached and uncached Memgraph regressions using the runnable
+  `examples/exact_sync` fixtures, including empty failed words and unchanged
+  generation.
+
+These contracts also specify the manuscript alignment: Algorithm 2's greedy
+failure must lead to forward motion-support BFS, `NO_PLAN` requires exhaustion,
+and `RESOURCE_BOUND` is inconclusive. Observation-aware validation and the
+caller-controlled disambiguation policy (`bound=1`, then `h-1` after proven
+absence) retain their existing lifecycle. The synthetic regressions establish
+the core fix; they do not reproduce the deployed warehouse `_allowed` wrapper
+or a robot experiment.
 
 ## Incremental Maintenance
 
@@ -256,7 +331,7 @@ native `macos-arm64`. The macOS job verifies `uname -m` is `arm64`; it is not a
 Linux cross-build.
 
 Each archive contains the CLI, static C library and public header, Memgraph
-module, Cypher scripts, warehouse example, Memgraph Lab GSS view, README,
+module, Cypher scripts, warehouse and exact-sync examples, Memgraph Lab GSS view, README,
 HACKING guide, license, and SHA-256 checksum. To inspect packaging locally:
 
 ```sh

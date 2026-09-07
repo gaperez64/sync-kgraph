@@ -36,6 +36,7 @@ typedef enum {
   SG_METHOD_PAIR_MERGE,
   SG_METHOD_PAIR_RESOLUTION,
   SG_METHOD_PARTITION_BFS,
+  SG_METHOD_SUBSET_BFS,
 } sg_plan_method;
 
 typedef enum {
@@ -179,6 +180,20 @@ sg_status sg_pair_oracle_merge_word(const sg_pair_oracle *oracle, size_t first, 
 sg_status sg_pair_oracle_resolution_word(const sg_pair_oracle *oracle, size_t first, size_t second,
                                          sg_word *word);
 
+/* Synchronization first applies greedy pair witnesses, then restarts exact
+ * forward motion-support BFS from the original support if greedy merging stalls.
+ * One positive budget covers both phases: one expansion per accepted witness,
+ * then one per non-goal support expanded by BFS. This does not bound action
+ * count, elapsed time, memory, or pair-record reads.
+ * PLAN is replay-verified from the original support. PAIR_MERGE preserves the
+ * fast-path word (not necessarily shortest); SUBSET_BFS identifies an exact
+ * fallback word. NO_PLAN proves absence for this automaton's action alphabet;
+ * RESOURCE_BOUND is inconclusive. Both unsuccessful outcomes have an empty word,
+ * method NONE, final_state SG_INDEX_NONE, and zero plan-derived metrics.
+ * A deduplicated singleton returns ALREADY_SATISFIED with method NONE.
+ * SG_OK still requires inspecting outcome. Errors retain their sg_status.
+ * The from-records entry point has the same contract and requires valid pair
+ * records for this automaton and generation. */
 sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
                        const size_t *initial_states, size_t initial_count, size_t budget,
                        sg_plan_result *result);

@@ -67,7 +67,7 @@ sync.validate_update
 ```
 
 Prebuilt releases contain Linux x86_64 and native macOS arm64 binaries, the C
-header and static library, Cypher scripts, the warehouse example, and the
+header and static library, Cypher scripts, the worked examples, and the
 Memgraph Lab view.
 
 ## Map A Model
@@ -161,8 +161,9 @@ next cached planning call without changing the model generation.
 Use the following execution lifecycle:
 
 1. Request a plan and inspect its `outcome`. Execute a word only for `PLAN`.
-   `ALREADY_SATISFIED` requires no actions; `NO_PLAN` and `RESOURCE_BOUND` do
-   not supply a guaranteed plan, even if the returned word is nonempty.
+   `ALREADY_SATISFIED` requires no actions. For synchronization, `NO_PLAN`
+   proves absence from the original support; `RESOURCE_BOUND` is inconclusive.
+   Both unsuccessful synchronization outcomes return an empty word.
 2. Save the plan's `generation`, original `hypotheses`, and full `word` together.
    Start with `completed_steps = 0` and `observed_outputs = []`.
 3. Once the caller commits the next action/output event, append that output and
@@ -189,15 +190,18 @@ stateDiagram-v2
     state "Await localizer report" as Waiting
     state "Obtain accepted nonempty support" as Replanning
     state "Reconcile evidence or model" as Reconciling
-    state "Caller chooses next planning attempt" as NoPlan
+    state "No word satisfies this request" as NoPlan
+    state "Search incomplete" as ResourceLimited
     state "Caller completion policy" as Completion
 
     [*] --> Ready
     Ready --> Planning: current generation prepared
     Planning --> Executing: PLAN / save plan, reset step and output trace
     Planning --> Completion: ALREADY_SATISFIED
-    Planning --> NoPlan: NO_PLAN or RESOURCE_BOUND
-    NoPlan --> Planning: caller revises request or budget
+    Planning --> NoPlan: NO_PLAN
+    Planning --> ResourceLimited: RESOURCE_BOUND
+    NoPlan --> Planning: caller changes support or objective
+    ResourceLimited --> Planning: caller retries with more budget
     Executing --> Validating: caller commits action and output / append once
     Validating --> Executing: CONTINUE / actions remain
     Validating --> Completion: CONTINUE / word exhausted
@@ -210,7 +214,7 @@ stateDiagram-v2
     Validating --> Ready: STALE_GENERATION / discard old plan
     Completion --> [*]
 
-    note right of NoPlan
+    note right of ResourceLimited
         RESOURCE_BOUND is inconclusive.
         It does not establish NO_PLAN.
     end note
@@ -263,6 +267,76 @@ The preparation options are independent:
 The process cache defaults to 512 MiB. Set `SYNC_KGRAPH_CACHE_MAX_BYTES` to a
 decimal byte limit, or `0` to disable retention. Durable pair records remain
 available when retention is disabled.
+
+### Synchronization Contract
+
+Since v0.5.1, synchronization first tries the existing pair-merging witnesses,
+then restarts an exact **forward motion-support BFS** from the original
+deduplicated support if greedy merging cannot finish. This happens inside the
+existing Planning stage, in both `plan_sync` and `plan_sync_uncached`. The
+preparation and monitor lifecycle, procedure signatures, and result fields
+stay the same.
+
+| Outcome | Meaning |
+| --- | --- |
+| `ALREADY_SATISFIED` | The original support is already a singleton. The empty word and final state are valid. |
+| `PLAN` | Replaying the returned word from the original support reaches one physical state. `PAIR_MERGE` identifies a fast-path success and `SUBSET_BFS` an exact fallback success. |
+| `NO_PLAN` | Exact reachable-support exhaustion proves that no synchronizing word exists from the original support using the model's action alphabet. |
+| `RESOURCE_BOUND` | The search still has work pending when its expansion budget runs out. Increasing the budget can resolve this outcome. |
+
+`status = "OK"` means the API operation completed; callers must inspect
+`outcome`. Invalid input, invalid models, allocation failures, and record-source
+errors remain errors and cannot establish `NO_PLAN`.
+
+The positive `budget` is shared by both phases. Each accepted pair witness
+costs one expansion; each non-goal support dequeued by BFS costs one more.
+The fallback keeps the expansions spent by greedy merging and discards its
+word. The budget counts algorithmic expansions, not actions in the word,
+elapsed time, memory, or pair-record reads. Finding a singleton or exhausting
+the frontier during the last permitted expansion still completes the search.
+
+```mermaid
+stateDiagram-v2
+    state "Deduplicate original support H" as Input
+    state "Greedy pair merging" as Greedy
+    state "Forward subset BFS from H" as Exact
+    state "Replay word from H" as Verify
+    state "PLAN or ALREADY_SATISFIED" as Success
+    state "NO_PLAN / exhausted reachable frontier" as Absent
+    state "RESOURCE_BOUND / search incomplete" as Limited
+
+    [*] --> Input
+    Input --> Verify: singleton / empty word
+    Input --> Greedy: multiple states
+    Greedy --> Verify: singleton / PAIR_MERGE
+    Greedy --> Exact: cannot finish / discard word, retain expansions
+    Exact --> Verify: singleton / SUBSET_BFS
+    Exact --> Absent: frontier exhausted
+    Exact --> Limited: pending frontier with no budget left
+    Verify --> Success: singleton image confirmed
+    Success --> [*]
+    Absent --> [*]
+    Limited --> [*]
+
+    note right of Exact
+        Same positive budget for both phases.
+        Keep equal-cardinality motion images.
+        Do not filter supports by observations.
+    end note
+```
+
+Errors in any phase propagate to the caller. Every success is independently
+replay-verified. Greedy merging does not guarantee a shortest word. The exact
+fallback explores words by length, retaining all distinct reachable supports,
+including steps that preserve cardinality. Its time and memory requirements
+can be exponential; completeness requires sufficient computation and memory.
+
+For `NO_PLAN` and `RESOURCE_BOUND`, `method` is `NONE`, `word` is `[]`, `length`
+and `final_support_size` are zero, and `final_state_key` is `""`. The C API uses
+`SG_INDEX_NONE` for the final state and also clears support/branch/homing
+metrics. Generation, actual expansions, and elapsed time are retained. A
+discarded greedy prefix is never returned as a plan or prepended to the exact
+word. See the [exact fallback example](#exact-synchronization-example).
 
 ### Incremental Updates
 
@@ -359,7 +433,7 @@ support. The planner always honors the requested bound; it does not perform
 this fallback automatically.
 
 Planner calls return an `outcome` of `PLAN`, `ALREADY_SATISFIED`, `NO_PLAN`, or
-`RESOURCE_BOUND`, and a `method` of `PAIR_MERGE`, `PAIR_RESOLUTION`,
+`RESOURCE_BOUND`, and a `method` of `PAIR_MERGE`, `SUBSET_BFS`, `PAIR_RESOLUTION`,
 `PARTITION_BFS`, or `NONE`. Explanation and monitoring retain the prepared-model
 lifecycle even when a word was obtained through the uncached API.
 
@@ -867,6 +941,58 @@ RETURN word, generation, decision, expected_hypotheses, observation_compatible;
 Expected: `[to_corridor]`, `3`, `CONTINUE`,
 `[west_bay:east, east_bay:west]`, `true`. An older plan still produces
 `STALE_GENERATION` even when the changed cell was not on its word.
+
+## Exact Synchronization Example
+
+Load the two complete seven-state models and run their cached/uncached queries:
+
+```sh
+mgconsole --no_history < examples/exact_sync/00_reset_and_load.cypher
+mgconsole --no_history < examples/exact_sync/01_plan.cypher
+```
+
+These files reset only `sync_fallback_positive` and `sync_fallback_negative`.
+Use the same schema and loaded module as the warehouse example. All outputs
+are `quiet`; the initial support is `H = {q0, q1, q2}`. The positive model is:
+
+| State | a | b | c |
+| --- | --- | --- | --- |
+| q0 | q3 | q5 | q4 |
+| q1 | q3 | q6 | q3 |
+| q2 | q4 | q5 | q3 |
+| q3 | q3 | q3 | q3 |
+| q4 | q4 | q4 | q4 |
+| q5 | q5 | q5 | q3 |
+| q6 | q6 | q6 | q3 |
+
+Greedy merging picks `a`, trapping the support at `{q3, q4}`. The exact fallback
+restarts from `H` and finds `b, c`: `H -> {q5, q6} -> {q3}`. For the negative
+model, only the last two `c` transitions change, to `q5` and `q6` respectively.
+Every original pair still has a merging witness, but no word synchronizes
+the whole support in that model.
+
+After running the files above, try:
+
+```cypher
+CALL sync.plan_sync("sync_fallback_positive", ["q0", "q1", "q2"], 4)
+YIELD status, outcome, method, word, final_state_key, expansions, generation
+RETURN status, outcome, method, word, final_state_key, expansions, generation;
+```
+
+Expected results for both cached and uncached calls:
+
+| Model | Budget | Outcome | Method | Word | Final state | Expansions |
+| --- | --- | --- | --- | --- | --- | --- |
+| Positive | 3 | `RESOURCE_BOUND` | `NONE` | `[]` | `""` | 3 |
+| Positive | 4 | `PLAN` | `SUBSET_BFS` | `["b", "c"]` | `q3` | 4 |
+| Negative | 3 | `RESOURCE_BOUND` | `NONE` | `[]` | `""` | 3 |
+| Negative | 4 | `NO_PLAN` | `NONE` | `[]` | `""` | 4 |
+
+Each call returns `status: "OK"` and `generation: 1`. One expansion is spent on
+the discarded greedy witness. The remaining three expand `H`, `{q3, q4}`, and
+`{q5, q6}`. The fourth total expansion can therefore either find the singleton
+or finish the absence proof. Retrying an inconclusive call starts a new search
+with the supplied total budget; search progress is not persisted.
 
 ## Developer Documentation
 

@@ -24,6 +24,18 @@ enum {
   NUMERIC_MUTATION_COUNT = 48,
   NUMERIC_MUTATION_STRIDE = 5,
   NUMERIC_ACTION_STRIDE = 7,
+  SYNC_TRAP_STATE_COUNT = 7,
+  SYNC_TRAP_LEFT = 5,
+  SYNC_TRAP_RIGHT = 6,
+  SYNC_NEUTRAL_STATE_COUNT = 10,
+  SYNC_NEUTRAL_BUDGET = 5,
+  SYNC_PERMUTATION_STATE_COUNT = 6,
+  SYNC_PERMUTATION_SUPPORT_COUNT = 20,
+  SYNC_SMALL_STATE_COUNT = 3,
+  SYNC_SMALL_ACTION_COUNT = 2,
+  SYNC_SMALL_CELL_COUNT = SYNC_SMALL_STATE_COUNT * SYNC_SMALL_ACTION_COUNT,
+  SYNC_SMALL_TABLE_COUNT = 729,
+  SYNC_SMALL_SUPPORT_COUNT = 1U << SYNC_SMALL_STATE_COUNT,
 };
 
 typedef struct {
@@ -141,6 +153,34 @@ static sg_status snapshot_read_records(void *context, const size_t *pair_ids, si
   return sg_pair_snapshot_read(context, pair_ids, pair_count, records);
 }
 
+typedef struct {
+  const sg_pair_oracle *oracle;
+  size_t calls;
+  size_t fail_on_call;
+  sg_status failure;
+  bool corrupt;
+} faulty_record_source;
+
+static sg_status faulty_read_records(void *context, const size_t *pair_ids, size_t pair_count,
+                                     sg_pair_record *records) {
+  faulty_record_source *source = context;
+  ++source->calls;
+  if (source->calls == source->fail_on_call) {
+    return source->failure;
+  }
+  for (size_t index = 0U; index < pair_count; ++index) {
+    const sg_status status =
+        sg_pair_oracle_record(source->oracle, pair_ids[index], &records[index]);
+    if (status != SG_OK) {
+      return status;
+    }
+    if (source->corrupt) {
+      records[index].pair = SG_INDEX_NONE;
+    }
+  }
+  return SG_OK;
+}
+
 static void add_keys(sg_automaton_builder *builder, const char *const *states, size_t state_count,
                      const char *const *actions, size_t action_count, const char *const *outputs,
                      size_t output_count) {
@@ -253,6 +293,55 @@ static sg_automaton *build_monitor_machine(void) {
   CHECK(sg_automaton_builder_build(builder, UINT64_C(1), &automaton) == SG_OK);
   sg_automaton_builder_free(builder);
   return automaton;
+}
+
+/* Columns are action-major, deliberately independent of the core's cell layout. */
+static sg_automaton *build_silent_machine(const size_t *columns, size_t state_count,
+                                          size_t action_count) {
+  static const char *const actions[] = {"a", "b", "c", "d"};
+  CHECK(action_count <= sizeof(actions) / sizeof(actions[0]));
+  sg_automaton_builder *builder = NULL;
+  CHECK(sg_automaton_builder_init(&builder) == SG_OK);
+  for (size_t state = 0U; state < state_count; ++state) {
+    char key[32] = {0};
+    CHECK(snprintf(key, sizeof(key), "q%zu", state) > 0);
+    CHECK(sg_automaton_builder_add_state(builder, key) == SG_OK);
+  }
+  for (size_t action = 0U; action < action_count; ++action) {
+    CHECK(sg_automaton_builder_add_action(builder, actions[action]) == SG_OK);
+  }
+  CHECK(sg_automaton_builder_add_output(builder, "quiet") == SG_OK);
+  for (size_t state = 0U; state < state_count; ++state) {
+    for (size_t action = 0U; action < action_count; ++action) {
+      const size_t target = columns[(action * state_count) + state];
+      CHECK(target < state_count);
+      char source_key[32] = {0};
+      char target_key[32] = {0};
+      CHECK(snprintf(source_key, sizeof(source_key), "q%zu", state) > 0);
+      CHECK(snprintf(target_key, sizeof(target_key), "q%zu", target) > 0);
+      CHECK(sg_automaton_builder_add_transition(builder, source_key, actions[action], target_key) ==
+            SG_OK);
+      CHECK(sg_automaton_builder_add_observation(builder, source_key, actions[action], "quiet") ==
+            SG_OK);
+    }
+  }
+  sg_automaton *automaton = NULL;
+  CHECK(sg_automaton_builder_build(builder, UINT64_C(1), &automaton) == SG_OK);
+  sg_automaton_builder_free(builder);
+  return automaton;
+}
+
+static sg_automaton *build_sync_trap(bool positive) {
+  size_t columns[][SYNC_TRAP_STATE_COUNT] = {
+      {3U, 3U, 4U, 3U, 4U, SYNC_TRAP_LEFT, SYNC_TRAP_RIGHT},
+      {SYNC_TRAP_LEFT, SYNC_TRAP_RIGHT, SYNC_TRAP_LEFT, 3U, 4U, SYNC_TRAP_LEFT, SYNC_TRAP_RIGHT},
+      {4U, 3U, 3U, 3U, 4U, 3U, 3U},
+  };
+  if (!positive) {
+    columns[2][SYNC_TRAP_LEFT] = SYNC_TRAP_LEFT;
+    columns[2][SYNC_TRAP_RIGHT] = SYNC_TRAP_RIGHT;
+  }
+  return build_silent_machine(&columns[0][0], SYNC_TRAP_STATE_COUNT, 3U);
 }
 
 static sg_automaton *build_numeric_automaton(const size_t *transitions, const size_t *observations,
@@ -402,6 +491,8 @@ static void test_names_and_builder_validation(void) {
   CHECK(strcmp(sg_status_name(SG_ERR_STALE_GENERATION), "STALE_GENERATION") == 0);
   CHECK(strcmp(sg_plan_outcome_name(SG_OUTCOME_RESOURCE_BOUND), "RESOURCE_BOUND") == 0);
   CHECK(strcmp(sg_plan_method_name(SG_METHOD_PARTITION_BFS), "PARTITION_BFS") == 0);
+  CHECK(strcmp(sg_plan_method_name(SG_METHOD_SUBSET_BFS), "SUBSET_BFS") == 0);
+  CHECK(SG_METHOD_PARTITION_BFS == 3 && SG_METHOD_SUBSET_BFS == 4);
   CHECK(strcmp(sg_monitor_decision_name(SG_MONITOR_MODEL_VIOLATION), "MODEL_VIOLATION") == 0);
 
   sg_automaton_builder *builder = NULL;
@@ -800,6 +891,301 @@ static void test_exact_partition_search(void) {
   sg_automaton_free(automaton);
 }
 
+static void check_empty_sync_result(const sg_plan_result *result) {
+  CHECK(result->word.length == 0U);
+  CHECK(result->word.actions == NULL);
+  CHECK(result->word.capacity == 0U);
+  CHECK(result->method == SG_METHOD_NONE);
+  CHECK(result->final_state == SG_INDEX_NONE);
+  CHECK(result->final_support_size == 0U);
+  CHECK(result->best_support_size == 0U);
+  CHECK(result->worst_support_size == 0U);
+  CHECK(result->branch_count == 0U);
+  CHECK(!result->homing);
+  CHECK(result->generation == 1U);
+}
+
+static void check_sync_replay(const sg_automaton *automaton, const size_t *initial,
+                              size_t initial_count, const sg_plan_result *result) {
+  size_t *final = calloc(initial_count, sizeof(*final));
+  CHECK(final != NULL);
+  size_t final_count = 0U;
+  CHECK(sg_apply_word(automaton, initial, initial_count, &result->word, final, &final_count) ==
+        SG_OK);
+  CHECK(final_count == 1U);
+  CHECK(final[0] == result->final_state);
+  CHECK(result->final_support_size == 1U);
+  free(final);
+}
+
+static void test_sync_fallback_case(bool positive) {
+  sg_automaton *automaton = build_sync_trap(positive);
+  sg_pair_oracle *built = NULL;
+  CHECK(sg_pair_oracle_build(automaton, &built) == SG_OK);
+  sg_pair_oracle *restored = restore_oracle(automaton, built);
+  sg_pair_snapshot *snapshot = NULL;
+  CHECK(sg_pair_snapshot_from_oracle(automaton, restored, &snapshot) == SG_OK);
+  const sg_pair_record_source source = {.context = snapshot, .read = snapshot_read_records};
+  const size_t initial[] = {0U, 1U, 2U};
+  const size_t pairs[][2] = {{0U, 1U}, {0U, 2U}, {1U, 2U}};
+  for (size_t pair = 0U; pair < 3U; ++pair) {
+    sg_word witness = {0};
+    CHECK(sg_pair_oracle_merge_word(built, pairs[pair][0], pairs[pair][1], &witness) == SG_OK);
+    CHECK(witness.length == 1U);
+    CHECK(witness.actions[0] == pair);
+    sg_word_free(&witness);
+  }
+  /* Baseline d83e521 chooses a and returns NO_PLAN with that abandoned prefix.
+   * All original pairs merge even in the negative fixture: that is not enough. */
+  for (size_t budget = 1U; budget <= 4U; ++budget) {
+    sg_plan_result plan = {0};
+    sg_plan_result restored_plan = {0};
+    sg_plan_result record_plan = {0};
+    CHECK(sg_plan_sync(automaton, built, initial, 3U, budget, &plan) == SG_OK);
+    CHECK(sg_plan_sync(automaton, restored, initial, 3U, budget, &restored_plan) == SG_OK);
+    CHECK(sg_plan_sync_from_records(automaton, &source, initial, 3U, budget, &record_plan) ==
+          SG_OK);
+    check_plan_semantics_equal(&plan, &restored_plan);
+    check_plan_semantics_equal(&plan, &record_plan);
+    CHECK(plan.expansions == budget);
+    if (budget < 4U) {
+      CHECK(plan.outcome == SG_OUTCOME_RESOURCE_BOUND);
+      check_empty_sync_result(&plan);
+    } else if (positive) {
+      CHECK(plan.outcome == SG_OUTCOME_PLAN);
+      CHECK(plan.method == SG_METHOD_SUBSET_BFS);
+      CHECK(plan.word.length == 2U);
+      CHECK(plan.word.actions[0] == 1U && plan.word.actions[1] == 2U);
+      CHECK(plan.final_state == 3U);
+      CHECK(plan.best_support_size == 1U && plan.worst_support_size == 1U);
+      CHECK(plan.branch_count == 1U && plan.homing);
+      CHECK(plan.generation == 1U);
+      check_sync_replay(automaton, initial, 3U, &plan);
+    } else {
+      CHECK(plan.outcome == SG_OUTCOME_NO_PLAN);
+      check_empty_sync_result(&plan);
+    }
+    sg_plan_result_free(&plan);
+    sg_plan_result_free(&restored_plan);
+    sg_plan_result_free(&record_plan);
+  }
+  sg_pair_snapshot_release(snapshot);
+  sg_pair_oracle_free(restored);
+  sg_pair_oracle_free(built);
+  sg_automaton_free(automaton);
+}
+
+static void test_sync_neutral_moves_and_queue_growth(void) {
+  static const size_t columns[][SYNC_NEUTRAL_STATE_COUNT] = {
+      {3U, 3U, 4U, 3U, 4U, 5U, 6U, 7U, 8U, 9U},
+      {7U, 8U, 9U, 3U, 4U, 5U, 6U, 7U, 8U, 9U},
+      {4U, 3U, 3U, 3U, 4U, 3U, 3U, 7U, 8U, 9U},
+      {0U, 1U, 2U, 3U, 4U, 5U, 6U, 5U, 6U, 5U},
+  };
+  sg_automaton *automaton = build_silent_machine(&columns[0][0], SYNC_NEUTRAL_STATE_COUNT, 4U);
+  sg_pair_oracle *oracle = NULL;
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  const size_t initial[] = {0U, 1U, 2U};
+  sg_plan_result plan = {0};
+  CHECK(sg_plan_sync(automaton, oracle, initial, 3U, SYNC_NEUTRAL_BUDGET - 1U, &plan) == SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_RESOURCE_BOUND);
+  CHECK(plan.expansions == SYNC_NEUTRAL_BUDGET - 1U);
+  check_empty_sync_result(&plan);
+  sg_plan_result_free(&plan);
+  CHECK(sg_plan_sync(automaton, oracle, initial, 3U, SYNC_NEUTRAL_BUDGET, &plan) == SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_PLAN && plan.method == SG_METHOD_SUBSET_BFS);
+  CHECK(plan.expansions == SYNC_NEUTRAL_BUDGET);
+  CHECK(plan.word.length == 3U);
+  CHECK(plan.word.actions[0] == 1U && plan.word.actions[1] == 3U && plan.word.actions[2] == 2U);
+  check_sync_replay(automaton, initial, 3U, &plan);
+  sg_plan_result_free(&plan);
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+
+  /* Two permutations generate all 20 three-state supports, forcing queue growth
+   * past its initial capacity. Every image has the same cardinality. */
+  static const size_t permutations[][SYNC_PERMUTATION_STATE_COUNT] = {{1U, 2U, 3U, 4U, 5U, 0U},
+                                                                      {1U, 0U, 2U, 3U, 4U, 5U}};
+  automaton = build_silent_machine(&permutations[0][0], SYNC_PERMUTATION_STATE_COUNT, 2U);
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  CHECK(sg_plan_sync(automaton, oracle, initial, 3U, SYNC_PERMUTATION_SUPPORT_COUNT - 1U, &plan) ==
+        SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_RESOURCE_BOUND);
+  CHECK(plan.expansions == SYNC_PERMUTATION_SUPPORT_COUNT - 1U);
+  check_empty_sync_result(&plan);
+  sg_plan_result_free(&plan);
+  CHECK(sg_plan_sync(automaton, oracle, initial, 3U, SYNC_PERMUTATION_SUPPORT_COUNT, &plan) ==
+        SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_NO_PLAN);
+  CHECK(plan.expansions == SYNC_PERMUTATION_SUPPORT_COUNT);
+  check_empty_sync_result(&plan);
+  sg_plan_result_free(&plan);
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+}
+
+static void test_sync_fallback_inputs_and_errors(void) {
+  sg_automaton *automaton = build_sync_trap(true);
+  sg_pair_oracle *oracle = NULL;
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  const size_t duplicates[] = {0U, 1U, 2U, 0U};
+  const size_t singleton[] = {3U, 3U};
+  const size_t invalid[] = {SYNC_TRAP_STATE_COUNT};
+  sg_plan_result plan = {0};
+  CHECK(sg_plan_sync(automaton, oracle, duplicates, 4U, 4U, &plan) == SG_OK);
+  CHECK(plan.method == SG_METHOD_SUBSET_BFS && plan.word.length == 2U);
+  CHECK(plan.word.actions[0] == 1U && plan.word.actions[1] == 2U);
+  check_sync_replay(automaton, duplicates, 4U, &plan);
+  sg_plan_result_free(&plan);
+  CHECK(sg_plan_sync(automaton, oracle, singleton, 2U, 1U, &plan) == SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_ALREADY_SATISFIED);
+  CHECK(plan.method == SG_METHOD_NONE && plan.word.length == 0U && plan.expansions == 0U);
+  CHECK(plan.final_state == 3U && plan.final_support_size == 1U);
+  CHECK(plan.best_support_size == 1U && plan.worst_support_size == 1U);
+  CHECK(plan.branch_count == 1U && plan.homing);
+  check_sync_replay(automaton, singleton, 2U, &plan);
+  sg_plan_result_free(&plan);
+  CHECK(sg_plan_sync(automaton, oracle, duplicates, 4U, 0U, &plan) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync(automaton, oracle, duplicates, 0U, 1U, &plan) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync(automaton, oracle, NULL, 1U, 1U, &plan) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync(automaton, oracle, invalid, 1U, 1U, &plan) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync(NULL, oracle, duplicates, 4U, 1U, &plan) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync(automaton, NULL, duplicates, 4U, 1U, &plan) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync(automaton, oracle, duplicates, 4U, 1U, NULL) == SG_ERR_INVALID_ARGUMENT);
+  CHECK(sg_plan_sync_from_records(automaton, NULL, duplicates, 4U, 1U, &plan) ==
+        SG_ERR_INVALID_ARGUMENT);
+  static const sg_status failures[] = {SG_ERR_ALLOC, SG_ERR_INVALID_MODEL, SG_ERR_NOT_FOUND,
+                                       SG_ERR_STALE_GENERATION, SG_ERR_RESOURCE_BOUND};
+  for (size_t failure = 0U; failure < sizeof(failures) / sizeof(failures[0]); ++failure) {
+    for (size_t fail_on_call = 1U; fail_on_call <= 3U; ++fail_on_call) {
+      faulty_record_source context = {
+          .oracle = oracle, .fail_on_call = fail_on_call, .failure = failures[failure]};
+      const sg_pair_record_source source = {.context = &context, .read = faulty_read_records};
+      CHECK(sg_plan_sync_from_records(automaton, &source, duplicates, 4U, 4U, &plan) ==
+            failures[failure]);
+      CHECK(context.calls == fail_on_call);
+      CHECK(plan.word.length == 0U && plan.word.actions == NULL);
+      sg_plan_result_free(&plan);
+    }
+  }
+  faulty_record_source corrupt = {.oracle = oracle, .corrupt = true};
+  const sg_pair_record_source source = {.context = &corrupt, .read = faulty_read_records};
+  CHECK(sg_plan_sync_from_records(automaton, &source, duplicates, 4U, 4U, &plan) ==
+        SG_ERR_INVALID_MODEL);
+  sg_plan_result_free(&plan);
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+
+  automaton = build_two_step_observer();
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  const size_t observer_initial[] = {0U, 1U};
+  CHECK(sg_plan_disambiguate(automaton, oracle, observer_initial, 2U, 1U, 4U, &plan) == SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_PLAN && plan.homing);
+  sg_plan_result_free(&plan);
+  CHECK(sg_plan_sync(automaton, oracle, observer_initial, 2U, 1U, &plan) == SG_OK);
+  CHECK(plan.outcome == SG_OUTCOME_NO_PLAN && plan.expansions == 1U);
+  CHECK(plan.word.length == 0U && plan.final_state == SG_INDEX_NONE);
+  sg_plan_result_free(&plan);
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+}
+
+/* Deliberately independent of the planner's bitsets, transitions and replay. */
+static unsigned small_sync_image(const size_t *columns, unsigned support, size_t action) {
+  unsigned image = 0U;
+  for (size_t state = 0U; state < SYNC_SMALL_STATE_COUNT; ++state) {
+    if ((support & (1U << state)) != 0U) {
+      image |= 1U << columns[(action * SYNC_SMALL_STATE_COUNT) + state];
+    }
+  }
+  return image;
+}
+
+static bool small_sync_exists(const size_t *columns, unsigned initial) {
+  unsigned queue[SYNC_SMALL_SUPPORT_COUNT] = {initial};
+  bool visited[SYNC_SMALL_SUPPORT_COUNT] = {false};
+  size_t count = 1U;
+  visited[initial] = true;
+  for (size_t head = 0U; head < count; ++head) {
+    const unsigned support = queue[head];
+    if ((support & (support - 1U)) == 0U) {
+      return true;
+    }
+    for (size_t action = 0U; action < SYNC_SMALL_ACTION_COUNT; ++action) {
+      const unsigned next = small_sync_image(columns, support, action);
+      if (!visited[next]) {
+        CHECK(count < SYNC_SMALL_SUPPORT_COUNT);
+        visited[next] = true;
+        queue[count++] = next;
+      }
+    }
+  }
+  return false;
+}
+
+static void check_small_sync_plan(const size_t *columns, unsigned initial,
+                                  const sg_plan_result *plan) {
+  unsigned support = initial;
+  for (size_t step = 0U; step < plan->word.length; ++step) {
+    CHECK(plan->word.actions[step] < SYNC_SMALL_ACTION_COUNT);
+    support = small_sync_image(columns, support, plan->word.actions[step]);
+  }
+  CHECK(support != 0U && (support & (support - 1U)) == 0U);
+  CHECK(plan->final_state < SYNC_SMALL_STATE_COUNT);
+  CHECK(support == (1U << plan->final_state));
+  CHECK(plan->final_support_size == 1U);
+  CHECK(plan->generation == 1U);
+}
+
+static void test_sync_exhaustive_small_models(void) {
+  static const size_t budgets[] = {1U, 64U};
+  for (size_t table = 0U; table < SYNC_SMALL_TABLE_COUNT; ++table) {
+    size_t columns[SYNC_SMALL_CELL_COUNT] = {0};
+    size_t encoding = table;
+    for (size_t cell = 0U; cell < SYNC_SMALL_CELL_COUNT; ++cell) {
+      columns[cell] = encoding % SYNC_SMALL_STATE_COUNT;
+      encoding /= SYNC_SMALL_STATE_COUNT;
+    }
+    sg_automaton *automaton =
+        build_silent_machine(columns, SYNC_SMALL_STATE_COUNT, SYNC_SMALL_ACTION_COUNT);
+    sg_pair_oracle *oracle = NULL;
+    CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+    for (unsigned support = 1U; support < SYNC_SMALL_SUPPORT_COUNT; ++support) {
+      const bool exists = small_sync_exists(columns, support);
+      size_t initial[SYNC_SMALL_STATE_COUNT] = {0};
+      size_t initial_count = 0U;
+      for (size_t state = 0U; state < SYNC_SMALL_STATE_COUNT; ++state) {
+        if ((support & (1U << state)) != 0U) {
+          initial[initial_count++] = state;
+        }
+      }
+      for (size_t index = 0U; index < sizeof(budgets) / sizeof(budgets[0]); ++index) {
+        sg_plan_result plan = {0};
+        CHECK(sg_plan_sync(automaton, oracle, initial, initial_count, budgets[index], &plan) ==
+              SG_OK);
+        CHECK(plan.expansions <= budgets[index]);
+        const bool success =
+            plan.outcome == SG_OUTCOME_PLAN || plan.outcome == SG_OUTCOME_ALREADY_SATISFIED;
+        if (success) {
+          CHECK(exists);
+          check_small_sync_plan(columns, support, &plan);
+        } else {
+          CHECK(plan.outcome == SG_OUTCOME_NO_PLAN || plan.outcome == SG_OUTCOME_RESOURCE_BOUND);
+          CHECK(plan.outcome != SG_OUTCOME_NO_PLAN || !exists);
+          check_empty_sync_result(&plan);
+        }
+        if (budgets[index] == 64U) {
+          CHECK(success == exists);
+          CHECK(success || plan.outcome == SG_OUTCOME_NO_PLAN);
+        }
+        sg_plan_result_free(&plan);
+      }
+    }
+    sg_pair_oracle_free(oracle);
+    sg_automaton_free(automaton);
+  }
+}
+
 static void test_oracle_source_equivalence(void) {
   sg_automaton *warehouse = build_warehouse();
   sg_pair_oracle *built = NULL;
@@ -1090,6 +1476,11 @@ int main(void) {
   test_observed_monitor_prefixes();
   test_observed_monitor_arguments();
   test_exact_partition_search();
+  test_sync_fallback_case(true);
+  test_sync_fallback_case(false);
+  test_sync_neutral_moves_and_queue_growth();
+  test_sync_fallback_inputs_and_errors();
+  test_sync_exhaustive_small_models();
   test_oracle_source_equivalence();
   test_incremental_pair_maintenance();
   test_snapshot_maintenance_and_cache();

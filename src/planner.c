@@ -41,6 +41,18 @@ typedef struct {
   size_t capacity;
 } sg_search_nodes;
 
+typedef struct {
+  sg_bitset support;
+  size_t parent;
+  size_t action;
+} sg_subset_node;
+
+typedef struct {
+  sg_subset_node *nodes;
+  size_t count;
+  size_t capacity;
+} sg_subset_search;
+
 static sg_status sg_bitset_init(sg_bitset *set, size_t state_count) {
   if (set == NULL || state_count == 0U) {
     return SG_ERR_INVALID_ARGUMENT;
@@ -455,12 +467,13 @@ static bool sg_sync_candidate_better(size_t count, size_t length, size_t pair, s
 }
 
 static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_record_source *source,
-                               const sg_bitset *active, sg_word *best_word,
-                               sg_bitset *best_support) {
+                               const sg_bitset *active, sg_word *best_word, sg_bitset *best_support,
+                               bool *found) {
+  *found = false;
   const size_t active_count = sg_bitset_count(active);
   size_t product = 0U;
   if (active_count < 2U || !sg_size_multiply(active_count, active_count - 1U, &product)) {
-    return active_count < 2U ? SG_ERR_NOT_FOUND : SG_ERR_ALLOC;
+    return active_count < 2U ? SG_OK : SG_ERR_ALLOC;
   }
   const size_t candidate_count = product / 2U;
   size_t *first_states = calloc(candidate_count, sizeof(*first_states));
@@ -499,7 +512,7 @@ static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_reco
   size_t best_count = SG_INDEX_NONE;
   size_t best_length = SG_INDEX_NONE;
   size_t best_pair = SG_INDEX_NONE;
-  status = SG_ERR_NOT_FOUND;
+  status = SG_OK;
   for (size_t index = 0U; index < candidate_count; ++index) {
     if (!available[index]) {
       continue;
@@ -532,10 +545,9 @@ static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_reco
   free(second_states);
   free(words);
   free(available);
-  if (status != SG_OK && status != SG_ERR_NOT_FOUND) {
-    return status;
-  }
-  return best_pair == SG_INDEX_NONE ? SG_ERR_NOT_FOUND : SG_OK;
+  /* A missing witness is distinct from any error returned by the record source. */
+  *found = status == SG_OK && best_pair != SG_INDEX_NONE;
+  return status;
 }
 
 static void sg_trace_partition_free(sg_trace_partition *partition) {
@@ -737,6 +749,129 @@ static sg_status sg_sync_finalize(const sg_automaton *automaton, const sg_bitset
   return status;
 }
 
+static void sg_subset_search_free(sg_subset_search *search) {
+  for (size_t index = 0U; index < search->count; ++index) {
+    sg_bitset_free(&search->nodes[index].support);
+  }
+  free(search->nodes);
+  *search = (sg_subset_search){0};
+}
+
+static sg_status sg_subset_search_add(sg_subset_search *search, const sg_bitset *support,
+                                      size_t parent, size_t action) {
+  if (search->count == search->capacity) {
+    const size_t capacity = search->capacity == 0U ? 16U : search->capacity * 2U;
+    size_t bytes = 0U;
+    if (capacity < search->capacity ||
+        !sg_size_multiply(capacity, sizeof(*search->nodes), &bytes)) {
+      return SG_ERR_ALLOC;
+    }
+    sg_subset_node *nodes = realloc(search->nodes, bytes);
+    if (nodes == NULL) {
+      return SG_ERR_ALLOC;
+    }
+    search->nodes = nodes;
+    search->capacity = capacity;
+  }
+  sg_bitset copy = {0};
+  const sg_status status = sg_bitset_copy(support, &copy);
+  if (status == SG_OK) {
+    search->nodes[search->count] =
+        (sg_subset_node){.support = copy, .parent = parent, .action = action};
+    ++search->count;
+  }
+  return status;
+}
+
+static bool sg_subset_search_contains(const sg_subset_search *search, const sg_bitset *support) {
+  for (size_t index = 0U; index < search->count; ++index) {
+    /* Complete set equality, including equal-cardinality but distinct supports. */
+    if (sg_bitset_equal(&search->nodes[index].support, support)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static sg_status sg_subset_reconstruct(const sg_subset_search *search, size_t parent,
+                                       size_t final_action, sg_word *word) {
+  sg_status status = sg_word_append(word, final_action);
+  size_t cursor = parent;
+  while (status == SG_OK && search->nodes[cursor].parent != SG_INDEX_NONE) {
+    status = sg_word_append(word, search->nodes[cursor].action);
+    cursor = search->nodes[cursor].parent;
+  }
+  for (size_t first = 0U, second = word->length; first < second && second != 0U; ++first) {
+    --second;
+    const size_t temporary = word->actions[first];
+    word->actions[first] = word->actions[second];
+    word->actions[second] = temporary;
+  }
+  return status;
+}
+
+static sg_status sg_subset_bfs(const sg_automaton *automaton, const sg_bitset *initial,
+                               size_t budget, sg_plan_result *result) {
+  if (result->expansions >= budget) {
+    result->outcome = SG_OUTCOME_RESOURCE_BOUND;
+    return SG_OK;
+  }
+  sg_subset_search search = {0};
+  sg_bitset next = {0};
+  sg_status status = sg_subset_search_add(&search, initial, SG_INDEX_NONE, SG_INDEX_NONE);
+  if (status == SG_OK) {
+    status = sg_bitset_init(&next, automaton->state_count);
+  }
+  size_t head = 0U;
+  result->outcome = SG_OUTCOME_NO_PLAN;
+  /* Each queued support is exactly delta(initial, its parent/action path).
+   * FIFO expansion stores every new action image, without observation filtering
+   * or cardinality pruning. Exhausting this frontier proves absence from initial. */
+  while (status == SG_OK && head < search.count && result->outcome != SG_OUTCOME_PLAN) {
+    if (result->expansions >= budget) {
+      result->outcome = SG_OUTCOME_RESOURCE_BOUND;
+      break;
+    }
+    const size_t parent = head;
+    ++head;
+    ++result->expansions;
+    for (size_t action = 0U; action < automaton->action_count; ++action) {
+      /* Reacquire the parent by index: adding a node can reallocate the queue. */
+      sg_apply_action_set(automaton, &search.nodes[parent].support, action, &next);
+      if (sg_bitset_count(&next) == 1U) {
+        status = sg_subset_reconstruct(&search, parent, action, &result->word);
+        if (status == SG_OK) {
+          result->outcome = SG_OUTCOME_PLAN;
+          result->method = SG_METHOD_SUBSET_BFS;
+        }
+        break;
+      }
+      if (!sg_subset_search_contains(&search, &next)) {
+        status = sg_subset_search_add(&search, &next, parent, action);
+        if (status != SG_OK) {
+          break;
+        }
+      }
+    }
+  }
+  /* A singleton or exhausted frontier on the final permitted expansion wins
+   * over timeout. Only a still-pending frontier is inconclusive. */
+  sg_bitset_free(&next);
+  sg_subset_search_free(&search);
+  return status;
+}
+
+static void sg_sync_discard_plan(sg_plan_result *result) {
+  sg_word_free(&result->word);
+  result->method = SG_METHOD_NONE;
+  result->final_state = SG_INDEX_NONE;
+  result->final_support_size = 0U;
+  result->best_support_size = 0U;
+  result->worst_support_size = 0U;
+  result->branch_count = 0U;
+  result->homing = false;
+}
+
 static sg_status sg_plan_sync_with_source(const sg_automaton *automaton,
                                           const sg_pair_record_source *source,
                                           const size_t *initial_states, size_t initial_count,
@@ -773,10 +908,11 @@ static sg_status sg_plan_sync_with_source(const sg_automaton *automaton,
     }
     sg_word witness = {0};
     sg_bitset next = {0};
-    status = sg_best_merge(automaton, source, &active, &witness, &next);
-    if (status == SG_ERR_NOT_FOUND) {
-      result->outcome = SG_OUTCOME_NO_PLAN;
-      status = SG_OK;
+    bool found = false;
+    status = sg_best_merge(automaton, source, &active, &witness, &next, &found);
+    if (status == SG_OK && !found) {
+      sg_word_free(&witness);
+      sg_bitset_free(&next);
       break;
     }
     if (status == SG_OK) {
@@ -791,11 +927,19 @@ static sg_status sg_plan_sync_with_source(const sg_automaton *automaton,
       sg_bitset_free(&next);
     }
   }
-  if (status == SG_OK && result->outcome != SG_OUTCOME_ALREADY_SATISFIED &&
-      sg_bitset_count(&active) == 1U) {
-    result->outcome = SG_OUTCOME_PLAN;
-    result->method = SG_METHOD_PAIR_MERGE;
-    status = sg_sync_finalize(automaton, &initial, result);
+  if (status == SG_OK && result->outcome != SG_OUTCOME_ALREADY_SATISFIED) {
+    if (sg_bitset_count(&active) == 1U) {
+      result->outcome = SG_OUTCOME_PLAN;
+      result->method = SG_METHOD_PAIR_MERGE;
+    } else {
+      /* A greedy dead end says nothing about other words from the original H.
+       * Discard its word, but retain its expansions within the one total budget. */
+      sg_sync_discard_plan(result);
+      status = sg_subset_bfs(automaton, &initial, budget, result);
+    }
+    if (status == SG_OK && result->outcome == SG_OUTCOME_PLAN) {
+      status = sg_sync_finalize(automaton, &initial, result);
+    }
   }
   result->planning_time_us = sg_elapsed_us(start);
   sg_bitset_free(&initial);

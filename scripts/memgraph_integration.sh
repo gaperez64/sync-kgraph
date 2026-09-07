@@ -767,4 +767,62 @@ RETURN CASE WHEN m.generation = 5 AND m.prepared_generation = 5
                  AND updated_pre = 5
             THEN "PASS" ELSE "FAIL" END AS result;'
 
+run_file "$root/examples/exact_sync/00_reset_and_load.cypher" >/dev/null
+
+for procedure in plan_sync_uncached plan_sync; do
+  source="RECOMPUTED"
+  if [ "$procedure" = "plan_sync" ]; then
+    source="PERSISTED"
+    for fixture in sync_fallback_positive sync_fallback_negative; do
+      assert_pass "prepare $fixture" "
+CALL sync.prepare_model(\"$fixture\", false, false) YIELD status, generation
+RETURN CASE WHEN status = \"OK\" AND generation = 1
+            THEN \"PASS\" ELSE \"FAIL\" END AS result;"
+    done
+  fi
+
+  assert_pass "$procedure exact fallback" "
+CALL sync.$procedure(\"sync_fallback_positive\", [\"q0\", \"q1\", \"q2\"], 4)
+YIELD status, outcome, method, word, length, final_state_key,
+      final_support_size, expansions, generation, oracle_source
+RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
+                 AND method = \"SUBSET_BFS\" AND word = [\"b\", \"c\"] AND length = 2
+                 AND final_state_key = \"q3\" AND final_support_size = 1
+                 AND expansions = 4 AND generation = 1 AND oracle_source = \"$source\"
+            THEN \"PASS\" ELSE \"FAIL\" END AS result;"
+
+  assert_pass "$procedure exhaustive negative" "
+CALL sync.$procedure(\"sync_fallback_negative\", [\"q0\", \"q1\", \"q2\"], 4)
+YIELD status, outcome, method, word, length, final_state_key,
+      final_support_size, expansions, generation, oracle_source
+RETURN CASE WHEN status = \"OK\" AND outcome = \"NO_PLAN\"
+                 AND method = \"NONE\" AND word = [] AND length = 0
+                 AND final_state_key = \"\" AND final_support_size = 0
+                 AND expansions = 4 AND generation = 1 AND oracle_source = \"$source\"
+            THEN \"PASS\" ELSE \"FAIL\" END AS result;"
+
+  assert_pass "$procedure shared budget discards greedy prefix" "
+UNWIND [\"sync_fallback_positive\", \"sync_fallback_negative\"] AS model
+UNWIND [1, 2, 3] AS budget
+CALL sync.$procedure(model, [\"q0\", \"q1\", \"q2\"], budget)
+YIELD status, outcome, method, word, length, final_state_key,
+      final_support_size, expansions, generation, oracle_source
+WITH collect(status = \"OK\" AND outcome = \"RESOURCE_BOUND\"
+             AND method = \"NONE\" AND word = [] AND length = 0
+             AND final_state_key = \"\" AND final_support_size = 0
+             AND expansions = budget AND generation = 1
+             AND oracle_source = \"$source\") AS checks
+RETURN CASE WHEN size(checks) = 6 AND all(ok IN checks WHERE ok)
+            THEN \"PASS\" ELSE \"FAIL\" END AS result;"
+done
+
+assert_pass "exact search leaves prepared generations unchanged" '
+MATCH (m:SyncModel)
+WHERE m.model IN ["sync_fallback_positive", "sync_fallback_negative"]
+WITH collect(m.generation = 1 AND m.prepared_generation = 1 AND NOT m.dirty) AS checks
+RETURN CASE WHEN size(checks) = 2 AND all(ok IN checks WHERE ok)
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+run_file "$root/examples/exact_sync/01_plan.cypher" >/dev/null
+
 echo "Memgraph integration test passed"

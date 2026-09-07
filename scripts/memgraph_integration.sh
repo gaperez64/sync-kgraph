@@ -55,9 +55,18 @@ assert_pass() {
 expect_failure() {
   name="$1"
   query="$2"
-  if run_query "$query" >/dev/null 2>&1; then
+  if output=$(run_query "$query" 2>&1); then
     printf '%s\n' "integration query unexpectedly succeeded: $name" >&2
     exit 1
+  fi
+  if [ -n "${3:-}" ]; then
+    case "$output" in
+    *"$3"*) ;;
+    *)
+      printf '%s\n' "integration query returned the wrong error: $name" "$output" >&2
+      exit 1
+      ;;
+    esac
   fi
 }
 
@@ -84,7 +93,7 @@ CALL mg.procedures() YIELD name
 WITH name
 WHERE name STARTS WITH "sync."
 WITH count(name) AS procedures
-RETURN CASE WHEN procedures = 9 THEN "PASS" ELSE "FAIL" END AS result;'
+RETURN CASE WHEN procedures = 10 THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "uncached synchronization before preparation" '
 CALL sync.plan_sync_uncached(
@@ -282,6 +291,185 @@ RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION"
                  AND size(unexpected_hypotheses) = 0 AND generation = 1
             THEN "PASS" ELSE "FAIL" END AS result;'
 
+assert_pass "observed monitor exact filtered support with default localizer" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1, ["west_landmark"], ["corridor_w:east"])
+YIELD status, decision, expected_hypotheses, unexpected_hypotheses, generation,
+      observation_compatible, failed_observation_step, observed_output, expected_outputs
+RETURN CASE WHEN status = "OK" AND decision = "CONTINUE" AND generation = 1
+                 AND expected_hypotheses = ["corridor_w:east"]
+                 AND unexpected_hypotheses = [] AND observation_compatible
+                 AND failed_observation_step IS NULL AND observed_output IS NULL
+                 AND expected_outputs = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor localizer shrinks filtered support further" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west", "dock:north"],
+  ["go_east"], 1, ["symmetric"], ["west_bay:east"], true)
+YIELD decision, expected_hypotheses, unexpected_hypotheses, observation_compatible
+RETURN CASE WHEN decision = "REPLAN" AND observation_compatible
+                 AND expected_hypotheses = ["west_bay:east", "east_bay:west"]
+                 AND unexpected_hypotheses = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "motion-compatible report contradicts the committed observation" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["west_landmark"], ["corridor_e:west"], true)
+YIELD decision, expected_hypotheses, unexpected_hypotheses, observation_compatible,
+      failed_observation_step, observed_output, expected_outputs
+RETURN CASE WHEN decision = "MODEL_VIOLATION" AND observation_compatible
+                 AND expected_hypotheses = ["corridor_w:east"]
+                 AND unexpected_hypotheses = ["corridor_e:west"]
+                 AND failed_observation_step IS NULL AND observed_output IS NULL
+                 AND expected_outputs = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+# Analogue of deployment log lines 51--53: an exact motion report with an impossible output.
+assert_pass "impossible output cannot be overridden by localization" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["symmetric"], ["corridor_w:east", "corridor_e:west"], true)
+YIELD status, decision, reason, expected_hypotheses, unexpected_hypotheses, generation,
+      observation_compatible, failed_observation_step, observed_output, expected_outputs
+RETURN CASE WHEN status = "OK" AND decision = "MODEL_VIOLATION" AND generation = 1
+                 AND reason = "committed output is incompatible with the predicted observations"
+                 AND NOT observation_compatible AND expected_hypotheses = []
+                 AND unexpected_hypotheses = ["corridor_w:east", "corridor_e:west"]
+                 AND failed_observation_step = 1 AND observed_output = "symmetric"
+                 AND expected_outputs = ["west_landmark", "east_landmark"]
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor wait returns the filtered support" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["east_landmark"], [], false)
+YIELD decision, expected_hypotheses, unexpected_hypotheses, observation_compatible,
+      failed_observation_step, observed_output, expected_outputs
+RETURN CASE WHEN decision = "WAIT" AND observation_compatible
+                 AND expected_hypotheses = ["corridor_e:west"] AND unexpected_hypotheses = []
+                 AND failed_observation_step IS NULL AND observed_output IS NULL
+                 AND expected_outputs = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor ignores an unavailable localizer report" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["east_landmark"], ["unavailable-state"], false)
+YIELD decision, expected_hypotheses, unexpected_hypotheses
+RETURN CASE WHEN decision = "WAIT" AND expected_hypotheses = ["corridor_e:west"]
+                 AND unexpected_hypotheses = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "impossible output without a localizer is still a violation" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["symmetric"], [], false)
+YIELD decision, expected_hypotheses, unexpected_hypotheses, observation_compatible,
+      failed_observation_step, observed_output, expected_outputs
+RETURN CASE WHEN decision = "MODEL_VIOLATION" AND NOT observation_compatible
+                 AND expected_hypotheses = [] AND unexpected_hypotheses = []
+                 AND failed_observation_step = 1 AND observed_output = "symmetric"
+                 AND expected_outputs = ["west_landmark", "east_landmark"]
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor replays the whole committed prefix" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "to_wall"], 2, ["west_landmark", "west_landmark"],
+  ["west_bay:east"], true)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN CASE WHEN decision = "CONTINUE" AND observation_compatible
+                 AND expected_hypotheses = ["west_bay:east"]
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "first incompatible observation uses only surviving hypotheses" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "to_wall", "to_corridor"], 3,
+  ["west_landmark", "east_landmark", "west_landmark"], [], false)
+YIELD decision, observation_compatible, failed_observation_step, observed_output,
+      expected_outputs, expected_hypotheses
+RETURN CASE WHEN decision = "MODEL_VIOLATION" AND NOT observation_compatible
+                 AND failed_observation_step = 2 AND observed_output = "east_landmark"
+                 AND expected_outputs = ["west_landmark"] AND expected_hypotheses = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor collapses duplicate successors" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["corridor_w:east", "corridor_e:west", "corridor_w:east"],
+  ["go_west"], 1, ["dock"], ["dock:north", "dock:north"], true)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN CASE WHEN decision = "CONTINUE" AND observation_compatible
+                 AND expected_hypotheses = ["dock:north"]
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor accepts an empty prefix" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"], [], 0, [],
+  ["west_bay:east", "east_bay:west"], true)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN CASE WHEN decision = "CONTINUE" AND observation_compatible
+                 AND expected_hypotheses = ["west_bay:east", "east_bay:west"]
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor distinguishes empty from unavailable localization" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["west_landmark"], [], true)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN CASE WHEN decision = "REPLAN" AND observation_compatible
+                 AND expected_hypotheses = ["corridor_w:east"]
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor stale generation skips current-model key resolution" '
+CALL sync.validate_observed_update(
+  "warehouse", 0, ["old-state"], ["old-action"], 1, ["old-output"], ["old-report"], true)
+YIELD status, decision, generation, expected_hypotheses, unexpected_hypotheses,
+      observation_compatible, failed_observation_step, observed_output, expected_outputs
+RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION" AND generation = 1
+                 AND expected_hypotheses = [] AND unexpected_hypotheses = []
+                 AND observation_compatible IS NULL AND failed_observation_step IS NULL
+                 AND observed_output IS NULL AND expected_outputs = []
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+expect_failure "observed monitor rejects unknown output keys clearly" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  ["to_corridor"], 1, ["unknown-output"], [], false)
+YIELD decision RETURN decision;' 'observed_outputs must contain known output keys'
+
+expect_failure "observed monitor rejects missing outputs" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  ["to_corridor"], 1, [], [], false)
+YIELD decision RETURN decision;' 'observed_outputs length must equal completed_steps'
+
+expect_failure "observed monitor rejects extra outputs" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  ["to_corridor"], 1, ["west_landmark", "dock"], [], false)
+YIELD decision RETURN decision;' 'observed_outputs length must equal completed_steps'
+
+expect_failure "observed monitor rejects invalid consumed actions" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  ["unknown-action"], 1, ["west_landmark"], [], false)
+YIELD decision RETURN decision;'
+
+expect_failure "observed monitor rejects steps beyond the word" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  [], 1, ["west_landmark"], [], false)
+YIELD decision RETURN decision;'
+
+expect_failure "observed monitor rejects negative completed steps" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  [], -1, [], [], false)
+YIELD decision RETURN decision;'
+
+expect_failure "observed monitor rejects unknown reported states" '
+CALL sync.validate_observed_update("warehouse", 1, ["west_bay:east"],
+  ["to_corridor"], 1, ["west_landmark"], ["unknown-state"], true)
+YIELD decision RETURN decision;'
+
 assert_pass "mark dirty" '
 CALL sync.mark_dirty("warehouse") YIELD status, generation
 RETURN CASE WHEN status = "DIRTY" AND generation = 2
@@ -310,6 +498,20 @@ YIELD status, decision, generation
 RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION"
                  AND generation = 2
             THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "observed monitor old plan is stale after model change" '
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor"], 1, ["west_landmark"], [], false)
+YIELD status, decision, generation, observation_compatible
+RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION" AND generation = 2
+                 AND observation_compatible IS NULL
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+expect_failure "observed monitor current generation requires a prepared model" '
+CALL sync.validate_observed_update(
+  "warehouse", 2, ["west_bay:east"], ["to_corridor"], 1, ["west_landmark"], [], false)
+YIELD decision RETURN decision;'
 
 assert_pass "reprepare without pair edges" '
 CALL sync.prepare_model("warehouse", false)

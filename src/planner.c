@@ -170,6 +170,17 @@ static void sg_apply_action_set(const sg_automaton *automaton, const sg_bitset *
   }
 }
 
+static void sg_apply_observed_action_set(const sg_automaton *automaton, const sg_bitset *source,
+                                         size_t action, size_t output, sg_bitset *destination) {
+  sg_bitset_clear(destination);
+  for (size_t state = 0U; state < automaton->state_count; ++state) {
+    if (sg_bitset_has(source, state) &&
+        sg_automaton_observation(automaton, state, action) == output) {
+      sg_bitset_add(destination, sg_automaton_transition(automaton, state, action));
+    }
+  }
+}
+
 static sg_status sg_apply_word_set(const sg_automaton *automaton, const sg_bitset *source,
                                    const sg_word *word, sg_bitset *destination) {
   sg_bitset current = {0};
@@ -1369,12 +1380,14 @@ void sg_monitor_result_free(sg_monitor_result *result) {
 static sg_status sg_monitor_fill_arrays(const sg_bitset *expected, const sg_bitset *reported,
                                         sg_monitor_result *result) {
   result->expected_count = sg_bitset_count(expected);
-  result->expected_states = malloc(result->expected_count * sizeof(*result->expected_states));
-  if (result->expected_states == NULL) {
-    return SG_ERR_ALLOC;
-  }
   size_t converted = 0U;
-  sg_bitset_to_ids(expected, result->expected_states, &converted);
+  if (result->expected_count != 0U) {
+    result->expected_states = malloc(result->expected_count * sizeof(*result->expected_states));
+    if (result->expected_states == NULL) {
+      return SG_ERR_ALLOC;
+    }
+    sg_bitset_to_ids(expected, result->expected_states, &converted);
+  }
   sg_bitset unexpected = {0};
   sg_status status = sg_bitset_init(&unexpected, expected->state_count);
   if (status != SG_OK) {
@@ -1470,6 +1483,126 @@ sg_status sg_validate_update(const sg_automaton *automaton, uint64_t plan_genera
   sg_bitset_free(&next);
   if (status != SG_OK) {
     sg_monitor_result_free(result);
+  }
+  return status;
+}
+
+void sg_observed_monitor_result_free(sg_observed_monitor_result *result) {
+  if (result == NULL) {
+    return;
+  }
+  sg_monitor_result_free(&result->monitor);
+  free(result->expected_outputs);
+  *result = (sg_observed_monitor_result){.monitor = {.decision = SG_MONITOR_WAIT},
+                                         .failed_observation_step = SG_INDEX_NONE,
+                                         .observed_output = SG_INDEX_NONE};
+}
+
+static sg_status sg_monitor_expected_outputs(const sg_automaton *automaton, const sg_bitset *source,
+                                             size_t action, sg_observed_monitor_result *result) {
+  sg_bitset outputs = {0};
+  sg_status status = sg_bitset_init(&outputs, automaton->output_count);
+  if (status != SG_OK) {
+    return status;
+  }
+  for (size_t state = 0U; state < automaton->state_count; ++state) {
+    if (sg_bitset_has(source, state)) {
+      sg_bitset_add(&outputs, sg_automaton_observation(automaton, state, action));
+    }
+  }
+  result->expected_output_count = sg_bitset_count(&outputs);
+  result->expected_outputs =
+      malloc(result->expected_output_count * sizeof(*result->expected_outputs));
+  if (result->expected_outputs == NULL) {
+    status = SG_ERR_ALLOC;
+  } else {
+    size_t converted = 0U;
+    sg_bitset_to_ids(&outputs, result->expected_outputs, &converted);
+  }
+  sg_bitset_free(&outputs);
+  return status;
+}
+
+sg_status sg_validate_observed_update(const sg_automaton *automaton, uint64_t plan_generation,
+                                      const size_t *initial_states, size_t initial_count,
+                                      const sg_word *word, size_t completed_steps,
+                                      const size_t *observed_outputs, size_t observed_count,
+                                      const size_t *reported_states, size_t reported_count,
+                                      bool localizer_available,
+                                      sg_observed_monitor_result *result) {
+  if (automaton == NULL || initial_states == NULL || initial_count == 0U || word == NULL ||
+      completed_steps > word->length || observed_count != completed_steps || result == NULL ||
+      (completed_steps != 0U && (word->actions == NULL || observed_outputs == NULL)) ||
+      (localizer_available && reported_count != 0U && reported_states == NULL)) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  *result = (sg_observed_monitor_result){
+      .monitor = {.decision = SG_MONITOR_WAIT, .generation = automaton->generation},
+      .failed_observation_step = SG_INDEX_NONE,
+      .observed_output = SG_INDEX_NONE};
+  if (plan_generation != automaton->generation) {
+    result->monitor.decision = SG_MONITOR_STALE_GENERATION;
+    return SG_OK;
+  }
+  /* Validate the whole consumed prefix even if an earlier output is impossible. */
+  for (size_t index = 0U; index < completed_steps; ++index) {
+    if (word->actions[index] >= automaton->action_count ||
+        observed_outputs[index] >= automaton->output_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+  }
+  sg_bitset expected = {0};
+  sg_bitset next = {0};
+  sg_bitset reported = {0};
+  sg_status status =
+      sg_bitset_from_ids(automaton->state_count, initial_states, initial_count, &expected);
+  if (status == SG_OK) {
+    status = sg_bitset_init(&next, automaton->state_count);
+  }
+  if (status == SG_OK) {
+    status =
+        localizer_available && reported_count != 0U
+            ? sg_bitset_from_ids(automaton->state_count, reported_states, reported_count, &reported)
+            : sg_bitset_init(&reported, automaton->state_count);
+  }
+  for (size_t index = 0U; status == SG_OK && index < completed_steps; ++index) {
+    const size_t action = word->actions[index];
+    sg_apply_observed_action_set(automaton, &expected, action, observed_outputs[index], &next);
+    const bool incompatible = sg_bitset_count(&next) == 0U;
+    if (incompatible) {
+      result->failed_observation_step = index + 1U;
+      result->observed_output = observed_outputs[index];
+      status = sg_monitor_expected_outputs(automaton, &expected, action, result);
+    }
+    sg_bitset temporary = expected;
+    expected = next;
+    next = temporary;
+    if (incompatible) {
+      break;
+    }
+  }
+  if (status == SG_OK) {
+    status = sg_monitor_fill_arrays(&expected, &reported, &result->monitor);
+  }
+  if (status == SG_OK) {
+    result->observation_compatible = result->failed_observation_step == SG_INDEX_NONE;
+    if (!result->observation_compatible) {
+      result->monitor.decision = SG_MONITOR_MODEL_VIOLATION;
+    } else if (localizer_available) {
+      if (sg_bitset_equal(&reported, &expected)) {
+        result->monitor.decision = SG_MONITOR_CONTINUE;
+      } else if (sg_bitset_subset(&reported, &expected)) {
+        result->monitor.decision = SG_MONITOR_REPLAN;
+      } else {
+        result->monitor.decision = SG_MONITOR_MODEL_VIOLATION;
+      }
+    }
+  }
+  sg_bitset_free(&expected);
+  sg_bitset_free(&next);
+  sg_bitset_free(&reported);
+  if (status != SG_OK) {
+    sg_observed_monitor_result_free(result);
   }
   return status;
 }

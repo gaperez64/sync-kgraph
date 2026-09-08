@@ -36,6 +36,7 @@ typedef enum {
   SG_METHOD_PAIR_MERGE,
   SG_METHOD_PAIR_RESOLUTION,
   SG_METHOD_PARTITION_BFS,
+  SG_METHOD_SUBSET_BFS,
   SG_METHOD_BELIEF_BFS,
 } sg_plan_method;
 
@@ -103,6 +104,20 @@ typedef struct {
   uint64_t generation;
 } sg_monitor_result;
 
+/* Separate result type preserves the ABI of the motion-only monitor. */
+typedef struct {
+  sg_monitor_result monitor;
+  /* Not evaluated for SG_MONITOR_STALE_GENERATION. */
+  bool observation_compatible;
+  /* First incompatible step, numbered from 1; SG_INDEX_NONE if none was found. */
+  size_t failed_observation_step;
+  /* Offending output ID, or SG_INDEX_NONE if none was found. */
+  size_t observed_output;
+  /* Possible output IDs immediately before the first incompatible observation. */
+  size_t *expected_outputs;
+  size_t expected_output_count;
+} sg_observed_monitor_result;
+
 typedef sg_status (*sg_explain_visitor)(void *context, size_t step, size_t action,
                                         const size_t *predicted_states, size_t predicted_count,
                                         const size_t *output_trace, size_t trace_length,
@@ -166,6 +181,20 @@ sg_status sg_pair_oracle_merge_word(const sg_pair_oracle *oracle, size_t first, 
 sg_status sg_pair_oracle_resolution_word(const sg_pair_oracle *oracle, size_t first, size_t second,
                                          sg_word *word);
 
+/* Synchronization first applies greedy pair witnesses, then restarts exact
+ * forward motion-support BFS from the original support if greedy merging stalls.
+ * One positive budget covers both phases: one expansion per accepted witness,
+ * then one per non-goal support expanded by BFS. This does not bound action
+ * count, elapsed time, memory, or pair-record reads.
+ * PLAN is replay-verified from the original support. PAIR_MERGE preserves the
+ * fast-path word (not necessarily shortest); SUBSET_BFS identifies an exact
+ * fallback word. NO_PLAN proves absence for this automaton's action alphabet;
+ * RESOURCE_BOUND is inconclusive. Both unsuccessful outcomes have an empty word,
+ * method NONE, final_state SG_INDEX_NONE, and zero plan-derived metrics.
+ * A deduplicated singleton returns ALREADY_SATISFIED with method NONE.
+ * SG_OK still requires inspecting outcome. Errors retain their sg_status.
+ * The from-records entry point has the same contract and requires valid pair
+ * records for this automaton and generation. */
 sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
                        const size_t *initial_states, size_t initial_count, size_t budget,
                        sg_plan_result *result);
@@ -181,19 +210,17 @@ sg_status sg_plan_disambiguate_from_records(const sg_automaton *automaton,
                                             const size_t *initial_states, size_t initial_count,
                                             size_t bound, size_t budget, sg_plan_result *result);
 sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *initial_states,
-                               size_t initial_count,
-                               const size_t *allowed_actions, size_t allowed_action_count,
-                               size_t budget, sg_plan_result *result);
+                               size_t initial_count, const size_t *allowed_actions,
+                               size_t allowed_action_count, size_t budget, sg_plan_result *result);
 sg_status sg_plan_disambiguate_allowed_from_records(
     const sg_automaton *automaton, const sg_pair_record_source *source,
-    const size_t *initial_states, size_t initial_count, size_t bound,
-    const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
-    sg_plan_result *result);
-sg_status sg_plan_disambiguate_allowed(const sg_automaton *automaton,
-                                       const sg_pair_oracle *oracle, const size_t *initial_states,
-                                       size_t initial_count, size_t bound,
-                                       const size_t *allowed_actions, size_t allowed_action_count,
-                                       size_t budget, sg_plan_result *result);
+    const size_t *initial_states, size_t initial_count, size_t bound, const size_t *allowed_actions,
+    size_t allowed_action_count, size_t budget, sg_plan_result *result);
+sg_status sg_plan_disambiguate_allowed(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                                       const size_t *initial_states, size_t initial_count,
+                                       size_t bound, const size_t *allowed_actions,
+                                       size_t allowed_action_count, size_t budget,
+                                       sg_plan_result *result);
 sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_states,
                        size_t initial_count, const size_t *goal_states, size_t goal_count,
                        const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
@@ -206,12 +233,35 @@ sg_status sg_apply_word(const sg_automaton *automaton, const size_t *initial_sta
 sg_status sg_explain_plan(const sg_automaton *automaton, uint64_t plan_generation,
                           const size_t *initial_states, size_t initial_count, const sg_word *word,
                           sg_explain_visitor visitor, void *context);
+/* Motion-only monitor: compare the localizer with delta(initial_states, prefix).
+ * A localizer report must be nonempty when available. No outputs are checked. */
 sg_status sg_validate_update(const sg_automaton *automaton, uint64_t plan_generation,
                              const size_t *initial_states, size_t initial_count,
                              const sg_word *word, size_t completed_steps,
                              const size_t *reported_states, size_t reported_count,
                              bool localizer_available, sg_monitor_result *result);
 void sg_monitor_result_free(sg_monitor_result *result);
+
+/* Mealy monitor: replay the consumed prefix using
+ *   S := {delta(q, a) | q in S and eta(q, a) == observed_output}.
+ * observed_count must equal completed_steps, and consumed actions and output IDs
+ * must belong to the automaton. A stale generation returns STALE_GENERATION
+ * without replaying or resolving IDs against the changed model.
+ * An impossible output returns MODEL_VIOLATION, even without a localizer.
+ * Otherwise an unavailable localizer returns WAIT with the conditioned support;
+ * an exact report returns CONTINUE, a strict subset (including an empty report)
+ * returns REPLAN, and any unexpected states return MODEL_VIOLATION.
+ * Reports are ignored when localizer_available is false. Supports are sets.
+ * The caller owns physical action-completion and sampling policy and supplies
+ * only committed outputs. Localization cannot override an impossible output.
+ * Free successful results with sg_observed_monitor_result_free before reuse. */
+sg_status sg_validate_observed_update(const sg_automaton *automaton, uint64_t plan_generation,
+                                      const size_t *initial_states, size_t initial_count,
+                                      const sg_word *word, size_t completed_steps,
+                                      const size_t *observed_outputs, size_t observed_count,
+                                      const size_t *reported_states, size_t reported_count,
+                                      bool localizer_available, sg_observed_monitor_result *result);
+void sg_observed_monitor_result_free(sg_observed_monitor_result *result);
 
 #ifdef __cplusplus
 }

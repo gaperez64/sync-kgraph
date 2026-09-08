@@ -31,7 +31,7 @@ fi
 cp README.md HACKING.md LICENSE "$stagedir/"
 cp include/sync_kgraph/sync.h "$stagedir/include/sync_kgraph/"
 cp cypher/*.cypher "$stagedir/cypher/"
-cp -R examples/warehouse "$stagedir/examples/"
+cp -R examples/warehouse examples/exact_sync "$stagedir/examples/"
 cp views/sync_automata.gss "$stagedir/views/"
 
 tar -C "$outdir" -czf "$outdir/sync-kgraph-$target.tar.gz" "sync-kgraph-$target"

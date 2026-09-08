@@ -25,6 +25,9 @@
 #define SG_SNAPSHOT_CACHE_DEFAULT_BYTES ((size_t)512U * (size_t)1024U * (size_t)1024U)
 #define SG_VALIDATE_REPORTED_ARGUMENT 5U
 #define SG_VALIDATE_AVAILABLE_ARGUMENT 6U
+#define SG_VALIDATE_OUTPUTS_ARGUMENT 5U
+#define SG_OBSERVED_VALIDATE_REPORTED_ARGUMENT 6U
+#define SG_OBSERVED_VALIDATE_AVAILABLE_ARGUMENT 7U
 
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory);
@@ -269,6 +272,12 @@ static bool insert_bool(struct mgp_result_record *record, const char *field, boo
   struct mgp_value *created = NULL;
   return mg_ok(mgp_value_make_bool(value ? 1 : 0, memory, &created)) &&
          insert_value(record, field, created);
+}
+
+static bool insert_null(struct mgp_result_record *record, const char *field,
+                        struct mgp_memory *memory) {
+  struct mgp_value *created = NULL;
+  return mg_ok(mgp_value_make_null(memory, &created)) && insert_value(record, field, created);
 }
 
 static bool new_record(struct mgp_result *result, struct mgp_result_record **record) {
@@ -938,7 +947,7 @@ static sg_status memgraph_store_write_record_batch(memgraph_pair_store *store,
   return ok ? SG_OK : SG_ERR_INVALID_MODEL;
 }
 
-static bool list_to_ids(const sg_automaton *automaton, struct mgp_value *value, bool actions,
+static bool list_to_ids(const sg_automaton *automaton, struct mgp_value *value, domain_kind domain,
                         bool allow_empty, size_t **ids, size_t *count) {
   *ids = NULL;
   *count = 0U;
@@ -959,8 +968,18 @@ static bool list_to_ids(const sg_automaton *automaton, struct mgp_value *value, 
       free(created);
       return false;
     }
-    const sg_status status = actions ? sg_automaton_find_action(automaton, key, &created[index])
-                                     : sg_automaton_find_state(automaton, key, &created[index]);
+    sg_status status = SG_ERR_INVALID_ARGUMENT;
+    switch (domain) {
+    case DOMAIN_STATE:
+      status = sg_automaton_find_state(automaton, key, &created[index]);
+      break;
+    case DOMAIN_ACTION:
+      status = sg_automaton_find_action(automaton, key, &created[index]);
+      break;
+    case DOMAIN_OUTPUT:
+      status = sg_automaton_find_output(automaton, key, &created[index]);
+      break;
+    }
     if (status != SG_OK) {
       free(created);
       return false;
@@ -974,7 +993,15 @@ static bool argument_to_ids(const sg_automaton *automaton, struct mgp_list *argu
                             bool actions, bool allow_empty, size_t **ids, size_t *count) {
   struct mgp_value *value = NULL;
   return get_arg(arguments, index, &value) &&
-         list_to_ids(automaton, value, actions, allow_empty, ids, count);
+         list_to_ids(automaton, value, actions ? DOMAIN_ACTION : DOMAIN_STATE, allow_empty, ids,
+                     count);
+}
+
+static bool argument_to_outputs(const sg_automaton *automaton, struct mgp_list *arguments,
+                                size_t **outputs, size_t *count) {
+  struct mgp_value *value = NULL;
+  return get_arg(arguments, SG_VALIDATE_OUTPUTS_ARGUMENT, &value) &&
+         list_to_ids(automaton, value, DOMAIN_OUTPUT, true, outputs, count);
 }
 
 static bool argument_to_word(const sg_automaton *automaton, struct mgp_list *arguments,
@@ -2121,7 +2148,6 @@ static void plan_sync_uncached_cb(struct mgp_list *arguments, struct mgp_graph *
   plan_sync_impl(arguments, graph, result, memory, ORACLE_SOURCE_RECOMPUTED);
 }
 
-
 /* Action-restricted planning and goal planning.
  *
  * Additive: upstream's plan_sync, plan_disambiguate and their _uncached
@@ -2219,26 +2245,26 @@ static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
   if (status != SG_OK) {
     set_status_error(result, "goal planning failed", status);
   } else {
-    size_t *final_states = calloc(hypothesis_count, sizeof(*final_states));
+    size_t *output_states = calloc(hypothesis_count, sizeof(*output_states));
     size_t final_count = 0U;
     sg_status apply_status = SG_OK;
-    if (final_states == NULL) {
+    if (output_states == NULL) {
       apply_status = SG_ERR_ALLOC;
     } else if (plan.outcome == SG_OUTCOME_PLAN || plan.outcome == SG_OUTCOME_ALREADY_SATISFIED) {
       apply_status = sg_apply_word(automaton, hypotheses, hypothesis_count, &plan.word,
-                                   final_states, &final_count);
+                                   output_states, &final_count);
     }
     struct mgp_result_record *record = NULL;
     int64_t final_support = 0;
     if (apply_status != SG_OK || !size_to_int64(plan.final_support_size, &final_support) ||
         !new_record(result, &record) ||
         !insert_plan_common(record, automaton, &plan, &metrics, memory) ||
-        !insert_key_list(record, "final_state_keys", automaton, final_states, final_count, false,
+        !insert_key_list(record, "final_state_keys", automaton, output_states, final_count, false,
                          memory) ||
         !insert_int(record, "final_support_size", final_support, memory)) {
       set_error(result, "failed to create goal-planning result");
     }
-    free(final_states);
+    free(output_states);
   }
   sg_plan_result_free(&plan);
   free(hypotheses);
@@ -2321,12 +2347,11 @@ static void plan_disambiguate_impl(struct mgp_list *arguments, struct mgp_graph 
     status = sg_pair_oracle_build(automaton, &oracle);
     metrics.oracle_time_us = elapsed_us(oracle_start);
     if (status == SG_OK) {
-      status = restricted
-                   ? sg_plan_disambiguate_allowed(automaton, oracle, hypotheses, hypothesis_count,
-                                                  (size_t)bound, actions, action_count,
-                                                  (size_t)budget, &plan)
-                   : sg_plan_disambiguate(automaton, oracle, hypotheses, hypothesis_count,
-                                          (size_t)bound, (size_t)budget, &plan);
+      status = restricted ? sg_plan_disambiguate_allowed(automaton, oracle, hypotheses,
+                                                         hypothesis_count, (size_t)bound, actions,
+                                                         action_count, (size_t)budget, &plan)
+                          : sg_plan_disambiguate(automaton, oracle, hypotheses, hypothesis_count,
+                                                 (size_t)bound, (size_t)budget, &plan);
     }
   }
   metrics.total_compute_time_us = elapsed_us(total_start);
@@ -2432,12 +2457,11 @@ static void explain_plan_cb(struct mgp_list *arguments, struct mgp_graph *graph,
   sg_automaton_free(automaton);
 }
 
-static bool insert_monitor_record(struct mgp_result *result, const sg_automaton *automaton,
+static bool insert_monitor_fields(struct mgp_result_record *record, const sg_automaton *automaton,
                                   const sg_monitor_result *monitor, const char *status,
                                   const char *reason, struct mgp_memory *memory) {
-  struct mgp_result_record *record = NULL;
   int64_t generation = 0;
-  return uint64_to_int64(monitor->generation, &generation) && new_record(result, &record) &&
+  return uint64_to_int64(monitor->generation, &generation) &&
          insert_string(record, "status", status, memory) &&
          insert_string(record, "decision", sg_monitor_decision_name(monitor->decision), memory) &&
          insert_string(record, "reason", reason, memory) &&
@@ -2446,6 +2470,14 @@ static bool insert_monitor_record(struct mgp_result *result, const sg_automaton 
          insert_key_list(record, "unexpected_hypotheses", automaton, monitor->unexpected_states,
                          monitor->unexpected_count, false, memory) &&
          insert_int(record, "generation", generation, memory);
+}
+
+static bool insert_monitor_record(struct mgp_result *result, const sg_automaton *automaton,
+                                  const sg_monitor_result *monitor, const char *status,
+                                  const char *reason, struct mgp_memory *memory) {
+  struct mgp_result_record *record = NULL;
+  return new_record(result, &record) &&
+         insert_monitor_fields(record, automaton, monitor, status, reason, memory);
 }
 
 static bool insert_stale_monitor(struct mgp_result *result, uint64_t generation,
@@ -2477,6 +2509,34 @@ static const char *monitor_reason(sg_monitor_decision decision) {
     return "localizer report unavailable";
   }
   return "unknown monitor decision";
+}
+
+static bool insert_observed_monitor_record(struct mgp_result *result, const sg_automaton *automaton,
+                                           const sg_observed_monitor_result *observed,
+                                           struct mgp_memory *memory) {
+  const bool failed = observed->failed_observation_step != SG_INDEX_NONE;
+  const bool stale = observed->monitor.decision == SG_MONITOR_STALE_GENERATION;
+  const char *reason = failed ? "committed output is incompatible with the predicted observations"
+                              : monitor_reason(observed->monitor.decision);
+  struct mgp_result_record *record = NULL;
+  if (!new_record(result, &record) ||
+      !insert_monitor_fields(record, automaton, &observed->monitor, "OK", reason, memory) ||
+      !(stale ? insert_null(record, "observation_compatible", memory)
+              : insert_bool(record, "observation_compatible", observed->observation_compatible,
+                            memory)) ||
+      !insert_key_list(record, "expected_outputs", automaton, observed->expected_outputs,
+                       observed->expected_output_count, true, memory)) {
+    return false;
+  }
+  if (!failed) {
+    return insert_null(record, "failed_observation_step", memory) &&
+           insert_null(record, "observed_output", memory);
+  }
+  int64_t step = 0;
+  const char *output = sg_automaton_output_key(automaton, observed->observed_output);
+  return output != NULL && size_to_int64(observed->failed_observation_step, &step) &&
+         insert_int(record, "failed_observation_step", step, memory) &&
+         insert_string(record, "observed_output", output, memory);
 }
 
 static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *graph,
@@ -2541,6 +2601,78 @@ static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *gra
   sg_word_free(&word);
   free(hypotheses);
   free(reported);
+  sg_automaton_free(automaton);
+}
+
+static void validate_observed_update_cb(struct mgp_list *arguments, struct mgp_graph *graph,
+                                        struct mgp_result *result, struct mgp_memory *memory) {
+  const char *model = NULL;
+  int64_t plan_generation = -1;
+  int64_t completed_steps = -1;
+  bool localizer_available = true;
+  if (!get_string_arg(arguments, 0U, &model) || !get_int_arg(arguments, 1U, &plan_generation) ||
+      !get_int_arg(arguments, 4U, &completed_steps) || plan_generation < 0 || completed_steps < 0 ||
+      (uint64_t)completed_steps > (uint64_t)SIZE_MAX ||
+      !get_bool_arg_default(arguments, SG_OBSERVED_VALIDATE_AVAILABLE_ARGUMENT, true,
+                            &localizer_available)) {
+    set_error(result, "invalid observation-aware validation arguments");
+    return;
+  }
+  model_metadata metadata = {0};
+  sg_status status = load_metadata(graph, memory, model, &metadata);
+  if (status != SG_OK) {
+    set_status_error(result, "model metadata lookup failed", status);
+    return;
+  }
+  if ((uint64_t)plan_generation != metadata.generation) {
+    const sg_observed_monitor_result stale = {
+        .monitor = {.decision = SG_MONITOR_STALE_GENERATION, .generation = metadata.generation},
+        .failed_observation_step = SG_INDEX_NONE,
+        .observed_output = SG_INDEX_NONE};
+    if (!insert_observed_monitor_record(result, NULL, &stale, memory)) {
+      set_error(result, "failed to create stale-generation result");
+    }
+    return;
+  }
+  sg_automaton *automaton = NULL;
+  if (!load_prepared_automaton(graph, memory, model, &metadata, &automaton, result)) {
+    return;
+  }
+  size_t *hypotheses = NULL;
+  size_t hypothesis_count = 0U;
+  size_t *reported = NULL;
+  size_t reported_count = 0U;
+  size_t *outputs = NULL;
+  size_t output_count = 0U;
+  sg_word word = {0};
+  sg_observed_monitor_result monitor = {0};
+  if (!argument_to_ids(automaton, arguments, 2U, false, false, &hypotheses, &hypothesis_count) ||
+      !argument_to_word(automaton, arguments, 3U, &word) ||
+      (localizer_available &&
+       !argument_to_ids(automaton, arguments, SG_OBSERVED_VALIDATE_REPORTED_ARGUMENT, false, true,
+                        &reported, &reported_count)) ||
+      (size_t)completed_steps > word.length) {
+    set_error(result, "hypotheses, word, step, or report is invalid for the prepared model");
+  } else if (!argument_to_outputs(automaton, arguments, &outputs, &output_count)) {
+    set_error(result, "observed_outputs must contain known output keys for the prepared model");
+  } else if (output_count != (size_t)completed_steps) {
+    set_error(result, "observed_outputs length must equal completed_steps");
+  } else {
+    status = sg_validate_observed_update(automaton, (uint64_t)plan_generation, hypotheses,
+                                         hypothesis_count, &word, (size_t)completed_steps, outputs,
+                                         output_count, reported, reported_count,
+                                         localizer_available, &monitor);
+    if (status != SG_OK) {
+      set_status_error(result, "observed update validation failed", status);
+    } else if (!insert_observed_monitor_record(result, automaton, &monitor, memory)) {
+      set_error(result, "failed to create observed-update-validation result");
+    }
+  }
+  sg_observed_monitor_result_free(&monitor);
+  sg_word_free(&word);
+  free(hypotheses);
+  free(reported);
+  free(outputs);
   sg_automaton_free(automaton);
 }
 
@@ -2970,7 +3102,6 @@ static bool register_plan_disambiguate(struct mgp_module *module, const char *na
          add_result(procedure, "homing", bool_type);
 }
 
-
 static void plan_disambiguate_allowed_cb(struct mgp_list *arguments, struct mgp_graph *graph,
                                          struct mgp_result *result, struct mgp_memory *memory) {
   plan_disambiguate_impl(arguments, graph, result, memory, ORACLE_SOURCE_PERSISTED, true);
@@ -3052,6 +3183,40 @@ static bool register_validate(struct mgp_module *module, struct mgp_memory *memo
          add_result(procedure, "generation", int_type);
 }
 
+static bool register_validate_observed(struct mgp_module *module, struct mgp_memory *memory,
+                                       struct mgp_type *string_type, struct mgp_type *bool_type,
+                                       struct mgp_type *int_type, struct mgp_type *list_type) {
+  struct mgp_proc *procedure = NULL;
+  struct mgp_type *nullable_string = NULL;
+  struct mgp_type *nullable_int = NULL;
+  struct mgp_type *nullable_bool = NULL;
+  if (!mg_ok(mgp_module_add_read_procedure(module, "validate_observed_update",
+                                           validate_observed_update_cb, &procedure)) ||
+      procedure == NULL || !mg_ok(mgp_type_nullable(string_type, &nullable_string)) ||
+      !mg_ok(mgp_type_nullable(int_type, &nullable_int)) ||
+      !mg_ok(mgp_type_nullable(bool_type, &nullable_bool))) {
+    return false;
+  }
+  return add_required(procedure, "model", string_type) &&
+         add_required(procedure, "generation", int_type) &&
+         add_required(procedure, "hypotheses", list_type) &&
+         add_required(procedure, "word", list_type) &&
+         add_required(procedure, "completed_steps", int_type) &&
+         add_required(procedure, "observed_outputs", list_type) &&
+         add_required(procedure, "reported_hypotheses", list_type) &&
+         add_optional_bool(procedure, "localizer_available", true, memory, bool_type) &&
+         add_result(procedure, "status", string_type) &&
+         add_result(procedure, "decision", string_type) &&
+         add_result(procedure, "reason", string_type) &&
+         add_result(procedure, "expected_hypotheses", list_type) &&
+         add_result(procedure, "unexpected_hypotheses", list_type) &&
+         add_result(procedure, "generation", int_type) &&
+         add_result(procedure, "observation_compatible", nullable_bool) &&
+         add_result(procedure, "failed_observation_step", nullable_int) &&
+         add_result(procedure, "observed_output", nullable_string) &&
+         add_result(procedure, "expected_outputs", list_type);
+}
+
 static bool register_mark_dirty(struct mgp_module *module, struct mgp_type *string_type,
                                 struct mgp_type *int_type) {
   struct mgp_proc *procedure = NULL;
@@ -3124,13 +3289,13 @@ int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
       !register_plan_disambiguate(module, "plan_disambiguate_uncached",
                                   plan_disambiguate_uncached_cb, string_type, bool_type, int_type,
                                   list_type) ||
-      !register_plan_disambiguate(module, "plan_disambiguate_allowed",
-                                  plan_disambiguate_allowed_cb, string_type, bool_type, int_type,
-                                  list_type) ||
+      !register_plan_disambiguate(module, "plan_disambiguate_allowed", plan_disambiguate_allowed_cb,
+                                  string_type, bool_type, int_type, list_type) ||
       !register_plan_sync_allowed(module, string_type, int_type, list_type) ||
       !register_plan_goal(module, string_type, int_type, list_type) ||
       !register_explain(module, string_type, int_type, list_type) ||
       !register_validate(module, memory, string_type, bool_type, int_type, list_type) ||
+      !register_validate_observed(module, memory, string_type, bool_type, int_type, list_type) ||
       !register_update_cells(module, memory, string_type, bool_type, int_type, map_list_type) ||
       !register_mark_dirty(module, string_type, int_type)) {
     sg_snapshot_cache_free(snapshot_cache);

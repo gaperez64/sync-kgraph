@@ -7,7 +7,7 @@ deterministic Mealy automaton. The module can then:
 - find a word that brings every current hypothesis to one state;
 - find a homing word whose outputs distinguish the current hypothesis;
 - explain predicted states and output branches after each action;
-- validate localization updates and detect stale plans; and
+- validate localization and committed output traces, detecting stale plans; and
 - maintain prepared planning data after transition or observation changes.
 
 Cypher is used only for schema, mapping, and queries. The mapping is manual so
@@ -62,11 +62,12 @@ sync.plan_sync
 sync.plan_sync_uncached
 sync.prepare_model
 sync.update_cells
+sync.validate_observed_update
 sync.validate_update
 ```
 
 Prebuilt releases contain Linux x86_64 and native macOS arm64 binaries, the C
-header and static library, Cypher scripts, the warehouse example, and the
+header and static library, Cypher scripts, the worked examples, and the
 Memgraph Lab view.
 
 ## Map A Model
@@ -109,14 +110,6 @@ application-owned relationship instead of adding `SyncState` to application
 nodes. The supplied uninstall script deletes nodes in the Sync-KGraph
 namespace.
 
-After creating the view:
-
-1. Set `dirty: true` and advance `generation`, or call
-   `sync.mark_dirty(model)` for an existing model.
-2. Call `sync.prepare_model(model, materialize_pair_edges, incremental)`.
-3. Store the returned generation with every plan.
-4. Reject or replan work when monitor output is `STALE_GENERATION`.
-
 `prepare_model` validates the complete Mealy model and creates the derived pair
 records used by cached planning. `PAIR_NEXT` and `PAIR_PRE` are optional
 inspection relationships; planning never requires them.
@@ -126,6 +119,125 @@ predicate to the application labels and relationships that feed each model. A
 schema-agnostic trigger cannot identify the affected model safely. Exclude
 writes made by `update_cells` because that procedure handles generation and
 repair atomically.
+
+## API Lifecycle
+
+Model preparation and execution progress are separate. Preparation belongs to
+a model generation; the caller retains execution progress for each plan.
+
+| Model state or change | Available API and next step |
+| --- | --- |
+| New or dirty view | Uncached planners can read the current view. Call `prepare_model` before using cached planners, `explain_plan`, or either monitor with the current generation. |
+| Clean prepared view | Plan, explain, and monitor against that generation. Enable `incremental` during preparation to use `update_cells`. |
+| Effective `update_cells` batch | The generation advances and prepared records are updated atomically. Plan again using the new generation; no additional preparation is required. |
+| `update_cells` returns `UNCHANGED` | The generation stays the same; existing plans remain current. |
+| Direct edits to the mapped view | Mark the model dirty and advance its generation as part of the edit, using `mark_dirty` or an adapted trigger, then prepare it again. |
+| Plan generation differs from the model | Either monitor returns `STALE_GENERATION`, including while the model is dirty. Prepare if needed and obtain a new plan. |
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "New or dirty model" as Dirty
+    state "Prepared generation" as Prepared
+
+    [*] --> Dirty
+    Dirty --> Prepared: prepare_model / same generation
+    Dirty --> Dirty: uncached planning / model stays unprepared
+    Prepared --> Dirty: direct edit + mark_dirty / advance generation
+    Prepared --> Prepared: effective update_cells / advance generation
+    Prepared --> Prepared: UNCHANGED update_cells / same generation
+
+    note right of Prepared
+        update_cells requires incremental mode.
+        Every generation change makes older plans stale.
+    end note
+```
+
+`prepare_model` rebuilds derived records at the current generation; it does not
+advance the model generation. An uncached plan does not prepare the model for
+later monitor calls. Module restarts and cache eviction cause hydration on the
+next cached planning call without changing the model generation.
+
+Use the following execution lifecycle:
+
+1. Request a plan and inspect its `outcome`. Execute a word only for `PLAN`.
+   `ALREADY_SATISFIED` requires no actions. For synchronization, `NO_PLAN`
+   proves absence from the original support; `RESOURCE_BOUND` is inconclusive.
+   Both unsuccessful synchronization outcomes return an empty word.
+2. Save the plan's `generation`, original `hypotheses`, and full `word` together.
+   Start with `completed_steps = 0` and `observed_outputs = []`.
+3. Once the caller commits the next action/output event, append that output and
+   increment `completed_steps` once. Call `validate_observed_update` with the
+   saved original support and the entire committed output prefix. Choose
+   `validate_update` when only motion consistency is required.
+4. Handle the monitor's decision using the table below. A later localizer
+   report for the same completed prefix reuses the same step count and output
+   list; it does not append another observation.
+5. Whenever a new plan is adopted, save its own original support, word, and
+   generation, and reset the step count and output list. A localization change
+   alone does not change the model generation or require preparation.
+
+The following states belong to the caller's execution cycle. Transitions out
+of validation are labeled with the observation-aware monitor's decisions;
+the library returns those decisions without driving the controller.
+
+```mermaid
+stateDiagram-v2
+    state "Prepare current generation if needed" as Ready
+    state "Request plan from current support" as Planning
+    state "Execute next action" as Executing
+    state "Validate full committed prefix" as Validating
+    state "Await localizer report" as Waiting
+    state "Obtain accepted nonempty support" as Replanning
+    state "Reconcile evidence or model" as Reconciling
+    state "No word satisfies this request" as NoPlan
+    state "Search incomplete" as ResourceLimited
+    state "Caller completion policy" as Completion
+
+    [*] --> Ready
+    Ready --> Planning: current generation prepared
+    Planning --> Executing: PLAN / save plan, reset step and output trace
+    Planning --> Completion: ALREADY_SATISFIED
+    Planning --> NoPlan: NO_PLAN
+    Planning --> ResourceLimited: RESOURCE_BOUND
+    NoPlan --> Planning: caller changes support or objective
+    ResourceLimited --> Planning: caller retries with more budget
+    Executing --> Validating: caller commits action and output / append once
+    Validating --> Executing: CONTINUE / actions remain
+    Validating --> Completion: CONTINUE / word exhausted
+    Validating --> Waiting: WAIT
+    Waiting --> Validating: localizer report / same step and output trace
+    Validating --> Replanning: REPLAN
+    Replanning --> Planning: use accepted support
+    Validating --> Reconciling: MODEL_VIOLATION
+    Reconciling --> Ready: caller resolves inconsistency
+    Validating --> Ready: STALE_GENERATION / discard old plan
+    Completion --> [*]
+
+    note right of ResourceLimited
+        RESOURCE_BOUND is inconclusive.
+        It does not establish NO_PLAN.
+    end note
+```
+
+This diagram shows execution through the prepared Memgraph monitor API.
+Uncached planning remains available before preparation. `CONTINUE` at the end
+of a word confirms consistency; the caller determines whether its objective is
+complete. The caller may also choose to replan when compatible observations
+reduce its support.
+
+| Monitor decision | Caller handling |
+| --- | --- |
+| `CONTINUE` | The supplied evidence matches the prediction. Continue with the remaining word, or replan from the support identified by accepted observations. At the end of the word, apply the caller's completion policy. |
+| `WAIT` | Expected hypotheses are available, but no localizer evidence was checked. Supply a localizer report for the same prefix when available. |
+| `REPLAN` | Replan from the accepted reported support. If that support is empty, obtain a nonempty support before calling a planner. |
+| `MODEL_VIOLATION` | Resolve the inconsistent observation, localization, or model before relying on the plan again. Inspect the separate observation and support diagnostics. |
+| `STALE_GENERATION` | Obtain a plan for the current model generation and reset its execution progress. Changing the generation attached to the old word does not revalidate that plan. |
+
+Both monitors are stateless: calling them does not commit execution, update the
+model, replace a plan, or remember a previous localizer report. The caller owns
+action-completion, sampling, and replanning policy. See
+[Runtime Monitoring](#runtime-monitoring) for the exact decision rules.
 
 ## Procedure API
 
@@ -155,6 +267,76 @@ The preparation options are independent:
 The process cache defaults to 512 MiB. Set `SYNC_KGRAPH_CACHE_MAX_BYTES` to a
 decimal byte limit, or `0` to disable retention. Durable pair records remain
 available when retention is disabled.
+
+### Synchronization Contract
+
+Since v0.5.1, synchronization first tries the existing pair-merging witnesses,
+then restarts an exact **forward motion-support BFS** from the original
+deduplicated support if greedy merging cannot finish. This happens inside the
+existing Planning stage, in both `plan_sync` and `plan_sync_uncached`. The
+preparation and monitor lifecycle, procedure signatures, and result fields
+stay the same.
+
+| Outcome | Meaning |
+| --- | --- |
+| `ALREADY_SATISFIED` | The original support is already a singleton. The empty word and final state are valid. |
+| `PLAN` | Replaying the returned word from the original support reaches one physical state. `PAIR_MERGE` identifies a fast-path success and `SUBSET_BFS` an exact fallback success. |
+| `NO_PLAN` | Exact reachable-support exhaustion proves that no synchronizing word exists from the original support using the model's action alphabet. |
+| `RESOURCE_BOUND` | The search still has work pending when its expansion budget runs out. Increasing the budget can resolve this outcome. |
+
+`status = "OK"` means the API operation completed; callers must inspect
+`outcome`. Invalid input, invalid models, allocation failures, and record-source
+errors remain errors and cannot establish `NO_PLAN`.
+
+The positive `budget` is shared by both phases. Each accepted pair witness
+costs one expansion; each non-goal support dequeued by BFS costs one more.
+The fallback keeps the expansions spent by greedy merging and discards its
+word. The budget counts algorithmic expansions, not actions in the word,
+elapsed time, memory, or pair-record reads. Finding a singleton or exhausting
+the frontier during the last permitted expansion still completes the search.
+
+```mermaid
+stateDiagram-v2
+    state "Deduplicate original support H" as Input
+    state "Greedy pair merging" as Greedy
+    state "Forward subset BFS from H" as Exact
+    state "Replay word from H" as Verify
+    state "PLAN or ALREADY_SATISFIED" as Success
+    state "NO_PLAN / exhausted reachable frontier" as Absent
+    state "RESOURCE_BOUND / search incomplete" as Limited
+
+    [*] --> Input
+    Input --> Verify: singleton / empty word
+    Input --> Greedy: multiple states
+    Greedy --> Verify: singleton / PAIR_MERGE
+    Greedy --> Exact: cannot finish / discard word, retain expansions
+    Exact --> Verify: singleton / SUBSET_BFS
+    Exact --> Absent: frontier exhausted
+    Exact --> Limited: pending frontier with no budget left
+    Verify --> Success: singleton image confirmed
+    Success --> [*]
+    Absent --> [*]
+    Limited --> [*]
+
+    note right of Exact
+        Same positive budget for both phases.
+        Keep equal-cardinality motion images.
+        Do not filter supports by observations.
+    end note
+```
+
+Errors in any phase propagate to the caller. Every success is independently
+replay-verified. Greedy merging does not guarantee a shortest word. The exact
+fallback explores words by length, retaining all distinct reachable supports,
+including steps that preserve cardinality. Its time and memory requirements
+can be exponential; completeness requires sufficient computation and memory.
+
+For `NO_PLAN` and `RESOURCE_BOUND`, `method` is `NONE`, `word` is `[]`, `length`
+and `final_support_size` are zero, and `final_state_key` is `""`. The C API uses
+`SG_INDEX_NONE` for the final state and also clears support/branch/homing
+metrics. Generation, actual expansions, and elapsed time are retained. A
+discarded greedy prefix is never returned as a plan or prepended to the exact
+word. See the [exact fallback example](#exact-synchronization-example).
 
 ### Incremental Updates
 
@@ -228,6 +410,9 @@ CALL sync.explain_plan(model, generation, hypotheses, word)
 CALL sync.validate_update(
   model, generation, hypotheses, word, completed_steps,
   reported_hypotheses, localizer_available = true)
+CALL sync.validate_observed_update(
+  model, generation, hypotheses, word, completed_steps,
+  observed_outputs, reported_hypotheses, localizer_available = true)
 CALL sync.mark_dirty(model)
 ```
 
@@ -236,8 +421,19 @@ CALL sync.mark_dirty(model)
 search expansions; `bound` is the required worst-case output-branch support
 size. A bound of one requests a homing word.
 
+For a support of `n` distinct states, the recommended caller policy is to try
+`bound = 1` first. Only after `NO_PLAN`, and when `n > 1`, try `bound = n - 1`
+for the weakest nontrivial guaranteed reduction. For `n = 2` these bounds are
+identical, so no retry is needed. Feasibility is monotone in the bound:
+`NO_PLAN` at `n - 1` rules out every stricter reduction bound. Testing each
+intermediate bound repeats searches for weaker objectives. `RESOURCE_BOUND`
+means the search was inconclusive and must not be treated as `NO_PLAN`.
+Execute until accepted information changes the support, then replan from that
+support. The planner always honors the requested bound; it does not perform
+this fallback automatically.
+
 Planner calls return an `outcome` of `PLAN`, `ALREADY_SATISFIED`, `NO_PLAN`, or
-`RESOURCE_BOUND`, and a `method` of `PAIR_MERGE`, `PAIR_RESOLUTION`,
+`RESOURCE_BOUND`, and a `method` of `PAIR_MERGE`, `SUBSET_BFS`, `PAIR_RESOLUTION`,
 `PARTITION_BFS`, or `NONE`. Explanation and monitoring retain the prepared-model
 lifecycle even when a word was obtained through the uncached API.
 
@@ -245,10 +441,88 @@ The public C API is in `include/sync_kgraph/sync.h`. It exposes the same
 automaton builder, pair oracle, planners, explanation visitor, and monitor
 without requiring Memgraph.
 
+### Runtime Monitoring
+
+`validate_update` is the motion-only consistency monitor. It compares the
+localizer report with `delta(H, prefix)`, without checking any sensor outputs.
+Its existing procedure signature and C result type are unchanged.
+
+`validate_observed_update` is the Mealy observation-aware consistency monitor.
+On every call, provide the original plan support `H`, its generation and word,
+and the full committed output prefix. `observed_outputs` contains public
+`output_key` strings, one per completed action, in order. Unknown output keys,
+invalid actions or states, and a length different from `completed_steps` are
+argument errors. Stale plans return `STALE_GENERATION` before resolving keys
+against the changed model, as with the motion-only procedure.
+
+Starting from `S = H`, each committed action `a` and output `o` updates:
+
+```text
+S := { delta(q, a) | q in S and eta(q, a) = o }
+```
+
+Outputs are evaluated on the source state and action, using the same Mealy
+convention as the disambiguation planner. Equal successor states are collapsed.
+The resulting support `E` includes only hypotheses compatible with the entire
+output prefix.
+
+| Condition | Decision | Returned expected support |
+| --- | --- | --- |
+| Generation differs from the model | `STALE_GENERATION` | `[]`; no observation check |
+| An output is impossible from every surviving hypothesis | `MODEL_VIOLATION` | `[]`, even if localization is unavailable |
+| Outputs are compatible and localization is unavailable | `WAIT` | `E` |
+| Localizer report equals `E` | `CONTINUE` | `E` |
+| Localizer report is a strict subset of `E` | `REPLAN` | `E` |
+| Localizer report includes a state outside `E` | `MODEL_VIOLATION` | `E` |
+
+Pass `reported_hypotheses = []` and `localizer_available = false` when the
+localizer is unavailable; its report is ignored. An explicitly available but
+empty report is a strict subset and returns `REPLAN` if the outputs are
+compatible. The original motion-only monitor still requires a nonempty report
+when localization is available.
+
+The new procedure returns the existing `status`, `decision`, `reason`,
+`expected_hypotheses`, `unexpected_hypotheses`, and `generation` fields, plus:
+
+| Field | Meaning |
+| --- | --- |
+| `observation_compatible` | `true` for a possible trace, `false` for an impossible trace, `null` for a stale plan |
+| `failed_observation_step` | First incompatible step, numbered from 1; otherwise `null` |
+| `observed_output` | Offending output key; otherwise `null` |
+| `expected_outputs` | Distinct possible output keys at the failing step, conditioned on earlier outputs; otherwise `[]` |
+
+`unexpected_hypotheses` always means reported states outside `E`, and is empty
+when localization is unavailable. Observation mismatches use the separate
+diagnostic fields. When `E` is empty, all reported states are unexpected.
+
+The C equivalent is `sg_validate_observed_update`, which takes numeric output
+IDs and returns `sg_observed_monitor_result`. Common fields are in its
+`monitor` member; absent diagnostic indices use `SG_INDEX_NONE`. The
+`observation_compatible` flag is unevaluated for a stale plan. Release the
+result with `sg_observed_monitor_result_free` before reuse. The C API validates
+only consumed action IDs; the Memgraph adapter resolves the whole supplied word.
+
+In C, monitoring requires a validated `sg_automaton` but no pair oracle or
+Memgraph preparation. Inputs are borrowed for the duration of the call; the
+result owns its returned arrays. Keep a plan result alive while using its
+`word`, and call `sg_plan_result_free` when replacing or retiring that plan.
+Check the returned `sg_status` before reading a monitor result: `SG_OK` means
+validation completed, and can accompany `MODEL_VIOLATION` or `STALE_GENERATION`.
+Likewise, a Memgraph row with `status = "OK"` still requires inspecting
+`decision`.
+
+The caller owns physical action-completion and sampling policy. Commit an
+action/output event before submitting it to the monitor. Localization cannot
+override an impossible committed output, even if its reported support matches
+the motion-only prediction. Timing, action continuation, goal selection, and
+responding to `REPLAN` remain caller responsibilities.
+
 ## Worked Warehouse Example
 
 The example maps two ambiguous bays, two corridor poses, and one dock pose.
-Run each numbered file with `mgconsole`, or execute the queries shown below.
+Execute the queries below in order, starting from the reset/load step. The
+[numbered Cypher files](examples/warehouse/README.md) provide a shorter runnable
+walkthrough; their comments give the expected generations for that sequence.
 
 ### 1. Install The Schema
 
@@ -419,7 +693,7 @@ CALL sync.explain_plan(
   ["to_corridor", "go_west"])
 YIELD step, action, predicted_hypotheses, output_trace, branch_hypotheses
 RETURN step, action, predicted_hypotheses, output_trace, branch_hypotheses
-ORDER BY step, output_trace;
+ORDER BY step, output_trace[0] DESC;
 ```
 
 Expected rows:
@@ -435,7 +709,9 @@ Expected rows:
 2, "go_west", [dock:north], [east_landmark, dock], [dock:north]
 ```
 
-### 8. Validate A Localization Update
+### 8. Monitor Committed Actions And Observations
+
+First, the existing motion-only API checks the localizer after `to_corridor`:
 
 ```cypher
 CALL sync.validate_update(
@@ -457,6 +733,98 @@ Reporting only one expected corridor returns `REPLAN`; reporting `dock:north`
 at this step returns `MODEL_VIOLATION`; passing an unavailable localizer returns
 `WAIT`.
 
+For the observation-aware API, retain the original plan from step 5. Once
+`to_corridor` has committed the output `west_landmark`, validation can proceed
+even if the localizer has not supplied a report:
+
+```cypher
+CALL sync.validate_observed_update(
+  "warehouse", 1,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1, ["west_landmark"], [], false)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN decision, expected_hypotheses, observation_compatible;
+```
+
+Expected: `WAIT`, `[corridor_w:east]`, `true`.
+When localization becomes available for that same completed action, submit
+the same step count and output prefix:
+
+```cypher
+CALL sync.validate_observed_update(
+  "warehouse", 1,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1, ["west_landmark"],
+  ["corridor_w:east"], true)
+YIELD decision, expected_hypotheses, observation_compatible,
+      failed_observation_step, observed_output, expected_outputs
+RETURN decision, expected_hypotheses, observation_compatible,
+       failed_observation_step, observed_output, expected_outputs;
+```
+
+Expected: `CONTINUE`, `[corridor_w:east]`, `true`, `null`, `null`, `[]`.
+Reporting `corridor_e:west` instead would return `MODEL_VIOLATION`, although
+that state belongs to the motion-only prediction.
+
+After the second action, `go_west`, commits output `dock`, replay both outputs
+from the original bays:
+
+```cypher
+CALL sync.validate_observed_update(
+  "warehouse", 1,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 2, ["west_landmark", "dock"],
+  ["dock:north"], true)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN decision, expected_hypotheses, observation_compatible;
+```
+
+Expected: `CONTINUE`, `[dock:north]`, `true`. The word is now exhausted;
+`CONTINUE` reports consistency, not a new action to execute.
+
+The next two queries illustrate independent alternative execution histories.
+An impossible first output is rejected even when localization exactly matches
+the motion-only prediction:
+
+```cypher
+CALL sync.validate_observed_update(
+  "warehouse", 1,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1, ["symmetric"],
+  ["corridor_w:east", "corridor_e:west"], true)
+YIELD decision, expected_hypotheses, observation_compatible,
+      failed_observation_step, observed_output, expected_outputs
+RETURN decision, expected_hypotheses, observation_compatible,
+       failed_observation_step, observed_output, expected_outputs;
+```
+
+Expected: `MODEL_VIOLATION`, `[]`, `false`, `1`, `symmetric`,
+`[west_landmark, east_landmark]`.
+
+For a strict-subset example, start from both bays and the dock, commit
+`go_east` with output `symmetric`, and report only `west_bay:east`. The output
+leaves both bays possible, while localization shrinks that support further.
+Replan from the accepted report and start the new plan at step zero:
+
+```cypher
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west", "dock:north"],
+  ["go_east"], 1, ["symmetric"], ["west_bay:east"], true)
+YIELD decision
+WITH decision, ["west_bay:east"] AS accepted_hypotheses
+WHERE decision = "REPLAN"
+CALL sync.plan_disambiguate("warehouse", accepted_hypotheses, 1, 64)
+YIELD outcome, word, generation
+RETURN decision, accepted_hypotheses, outcome, word, generation;
+```
+
+Expected: `REPLAN`, `[west_bay:east]`, `ALREADY_SATISFIED`, `[]`, `1`.
+The accepted singleton already satisfies homing, so this example requires no
+further disambiguation actions. If replanning returns `PLAN`, monitor its word
+with `accepted_hypotheses` as the new original support, `completed_steps = 0`,
+and `observed_outputs = []`. Reusing the previous output trace would attach
+observations to the wrong word.
+
 ### 9. Invalidate Old Plans
 
 ```cypher
@@ -473,11 +841,23 @@ Expected:
 Cached planning is now rejected until
 `sync.prepare_model("warehouse", false)` succeeds. Uncached planning remains
 available against the current base view and returns generation 2. A monitor
-call carrying generation 1 returns:
+call carrying generation 1 still returns a stale result while the model is
+dirty:
+
+```cypher
+CALL sync.validate_observed_update(
+  "warehouse", 1, ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1, ["west_landmark"], [], false)
+YIELD status, decision, generation, observation_compatible
+RETURN status, decision, generation, observation_compatible;
+```
 
 ```text
-status: "OK", decision: "STALE_GENERATION", generation: 2
+"OK", "STALE_GENERATION", 2, null
 ```
+
+Monitoring a generation-2 word requires preparation first. Keep the saved
+generation-1 word marked stale; obtain a new plan for generation 2.
 
 ### 10. Prepare And Update Incrementally
 
@@ -541,6 +921,78 @@ Expected:
 Cached and uncached homing calls still return `["to_corridor"]` with generation
 3. An invalid key aborts the whole batch and leaves generation, base cells, and
 the oracle unchanged.
+
+The successful update kept generation 3 prepared. A new plan can therefore be
+created and its initial support validated immediately, with an empty output
+prefix:
+
+```cypher
+WITH ["west_bay:east", "east_bay:west"] AS hypotheses
+CALL sync.plan_disambiguate("warehouse", hypotheses, 1, 64)
+YIELD outcome, word, generation
+WITH hypotheses, word, generation, outcome
+WHERE outcome = "PLAN"
+CALL sync.validate_observed_update(
+  "warehouse", generation, hypotheses, word, 0, [], hypotheses, true)
+YIELD decision, expected_hypotheses, observation_compatible
+RETURN word, generation, decision, expected_hypotheses, observation_compatible;
+```
+
+Expected: `[to_corridor]`, `3`, `CONTINUE`,
+`[west_bay:east, east_bay:west]`, `true`. An older plan still produces
+`STALE_GENERATION` even when the changed cell was not on its word.
+
+## Exact Synchronization Example
+
+Load the two complete seven-state models and run their cached/uncached queries:
+
+```sh
+mgconsole --no_history < examples/exact_sync/00_reset_and_load.cypher
+mgconsole --no_history < examples/exact_sync/01_plan.cypher
+```
+
+These files reset only `sync_fallback_positive` and `sync_fallback_negative`.
+Use the same schema and loaded module as the warehouse example. All outputs
+are `quiet`; the initial support is `H = {q0, q1, q2}`. The positive model is:
+
+| State | a | b | c |
+| --- | --- | --- | --- |
+| q0 | q3 | q5 | q4 |
+| q1 | q3 | q6 | q3 |
+| q2 | q4 | q5 | q3 |
+| q3 | q3 | q3 | q3 |
+| q4 | q4 | q4 | q4 |
+| q5 | q5 | q5 | q3 |
+| q6 | q6 | q6 | q3 |
+
+Greedy merging picks `a`, trapping the support at `{q3, q4}`. The exact fallback
+restarts from `H` and finds `b, c`: `H -> {q5, q6} -> {q3}`. For the negative
+model, only the last two `c` transitions change, to `q5` and `q6` respectively.
+Every original pair still has a merging witness, but no word synchronizes
+the whole support in that model.
+
+After running the files above, try:
+
+```cypher
+CALL sync.plan_sync("sync_fallback_positive", ["q0", "q1", "q2"], 4)
+YIELD status, outcome, method, word, final_state_key, expansions, generation
+RETURN status, outcome, method, word, final_state_key, expansions, generation;
+```
+
+Expected results for both cached and uncached calls:
+
+| Model | Budget | Outcome | Method | Word | Final state | Expansions |
+| --- | --- | --- | --- | --- | --- | --- |
+| Positive | 3 | `RESOURCE_BOUND` | `NONE` | `[]` | `""` | 3 |
+| Positive | 4 | `PLAN` | `SUBSET_BFS` | `["b", "c"]` | `q3` | 4 |
+| Negative | 3 | `RESOURCE_BOUND` | `NONE` | `[]` | `""` | 3 |
+| Negative | 4 | `NO_PLAN` | `NONE` | `[]` | `""` | 4 |
+
+Each call returns `status: "OK"` and `generation: 1`. One expansion is spent on
+the discarded greedy witness. The remaining three expand `H`, `{q3, q4}`, and
+`{q5, q6}`. The fourth total expansion can therefore either find the singleton
+or finish the absence proof. Retrying an inconclusive call starts a new search
+with the supplied total budget; search progress is not persisted.
 
 ## Developer Documentation
 

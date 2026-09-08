@@ -74,7 +74,7 @@ flowchart LR
   T["epoch + generation + token"] --> R
   T --> S
 
-  Q["prepared planner"] --> M["Read model metadata"]
+  Q["prepared pair-oracle planner"] --> M["Read model metadata"]
   M --> H{"Exact LRU key?"}
   H -- "yes: HOT" --> S
   H -- "no" --> D["Hydrate and validate pair records"]
@@ -90,7 +90,9 @@ flowchart LR
 
 `HOT` means the exact snapshot was already in the LRU. `HYDRATED` means the
 procedure rebuilt the process snapshot from durable pair records. `BYPASSED`
-is reserved for uncached procedures. Hydration reads records in batches of
+means no snapshot was used: uncached procedures rebuild an oracle, while
+`plan_sync_allowed` and `plan_goal` search the prepared automaton directly and
+report `oracle_source=NONE`. Hydration reads records in batches of
 4,096 and validates the complete snapshot before exposing it.
 
 The default LRU limit is 512 MiB. `SYNC_KGRAPH_CACHE_MAX_BYTES` accepts a
@@ -165,13 +167,42 @@ The regression suite includes:
   `examples/exact_sync` fixtures, including empty failed words and unchanged
   generation.
 
+`sg_plan_sync_allowed` uses the same fallback, now parameterized by permitted
+actions. Its pair witnesses are searched on the automaton because a full-alphabet
+oracle witness may use forbidden actions. Both phases preserve the query's
+alphabet. The unrestricted entry points keep their pair-oracle fast path;
+restricted entry points share its objective, outcome rules, and expansion
+accounting, with witness ties resolved by their supplied action order.
+Restricted disambiguation discards forbidden heuristic words before partition
+search and propagates record-source errors separately from missing witnesses.
+
+`sg_plan_goal` performs forward support search for containment in a supplied
+goal set, without a greedy phase. `BELIEF_BFS` identifies goal successes; the
+new value is appended after the released `SUBSET_BFS`. Initial containment
+uses `ALREADY_SATISFIED/NONE`. Multi-state final supports are valid for goal
+containment, while physical synchronization requires a singleton. Both searches
+preserve equal-cardinality moves, independently replay successful words, and
+use frontier exhaustion for a negative certificate.
+
+The v0.5.2 regressions extend the independent small-model BFS to all three
+nonempty action subsets: 15,309 model/support/alphabet combinations, with
+restricted synchronization checked at two budgets and all seven goal sets
+checked at an ample budget (107,163 goal queries). Tests also exercise neutral
+moves, goal queue growth beyond 32 nodes, restricted built/restored/from-records
+disambiguation, rejected heuristic words, null models, invalid actions, source
+errors, and Memgraph generation/monitor lifecycle. The adapter's argument-error
+paths release parsed hypotheses and action lists; oracle-free planners report
+actual compute time without claiming persisted witness reads.
+
 These contracts also specify the manuscript alignment: Algorithm 2's greedy
 failure must lead to forward motion-support BFS, `NO_PLAN` requires exhaustion,
 and `RESOURCE_BOUND` is inconclusive. Observation-aware validation and the
 caller-controlled disambiguation policy (`bound=1`, then `h-1` after proven
 absence) retain their existing lifecycle. The synthetic regressions establish
-the core fix; they do not reproduce the deployed warehouse `_allowed` wrapper
-or a robot experiment.
+the core fix and the public restricted planners; they do not reproduce the
+deployed robot experiment. Goal containment is a separate objective and must
+not be described as synchronized arrival in one physical state. It neither
+widens the supplied target set nor establishes adaptive-policy completeness.
 
 ## Incremental Maintenance
 

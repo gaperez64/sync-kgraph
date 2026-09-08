@@ -21,6 +21,8 @@ become an automaton.
 | Repeated low-latency plans | `plan_sync`, `plan_disambiguate` | `prepare_model(..., false, false)` | Read-mostly models |
 | Frequent small model changes | Cached planners plus `update_cells` | `prepare_model(..., false, true)` | Incrementally maintained models |
 | A baseline or one-off plan | `plan_sync_uncached`, `plan_disambiguate_uncached` | None | Rebuilds from the base view on every call |
+| Hardware supports only part of the alphabet | `plan_sync_allowed`, `plan_disambiguate_allowed` | Clean prepared model | Every returned action is permitted by the caller |
+| Reach a supplied goal set | `plan_goal` | Clean prepared model | Every possible final state lies in the goal set |
 | Inspect pair transitions in Memgraph Lab | Any cached mode | Set `materialize_pair_edges` to `true` | Visualization only; it does not accelerate planning |
 
 Cached and uncached planners return the same semantic result for the same model
@@ -57,8 +59,11 @@ Expected procedure names:
 sync.explain_plan
 sync.mark_dirty
 sync.plan_disambiguate
+sync.plan_disambiguate_allowed
 sync.plan_disambiguate_uncached
+sync.plan_goal
 sync.plan_sync
+sync.plan_sync_allowed
 sync.plan_sync_uncached
 sync.prepare_model
 sync.update_cells
@@ -127,7 +132,7 @@ a model generation; the caller retains execution progress for each plan.
 
 | Model state or change | Available API and next step |
 | --- | --- |
-| New or dirty view | Uncached planners can read the current view. Call `prepare_model` before using cached planners, `explain_plan`, or either monitor with the current generation. |
+| New or dirty view | Uncached planners can read the current view. Call `prepare_model` before using cached, restricted, or goal planners, `explain_plan`, or either monitor with the current generation. |
 | Clean prepared view | Plan, explain, and monitor against that generation. Enable `incremental` during preparation to use `update_cells`. |
 | Effective `update_cells` batch | The generation advances and prepared records are updated atomically. Plan again using the new generation; no additional preparation is required. |
 | `update_cells` returns `UNCHANGED` | The generation stays the same; existing plans remain current. |
@@ -163,8 +168,10 @@ Use the following execution lifecycle:
 1. Request a plan and inspect its `outcome`. Execute a word only for `PLAN`.
    `ALREADY_SATISFIED` requires no actions. For synchronization, `NO_PLAN`
    proves absence from the original support; `RESOURCE_BOUND` is inconclusive.
-   Both unsuccessful synchronization outcomes return an empty word.
+   Both unsuccessful synchronization outcomes return an empty word. Goal search
+   follows the same outcome rules for containment in its supplied goal set.
 2. Save the plan's `generation`, original `hypotheses`, and full `word` together.
+   Retain the permitted actions and goal set, when applicable, for replanning.
    Start with `completed_steps = 0` and `observed_outputs = []`.
 3. Once the caller commits the next action/output event, append that output and
    increment `completed_steps` once. Call `validate_observed_update` with the
@@ -273,7 +280,8 @@ available when retention is disabled.
 Since v0.5.1, synchronization first tries the existing pair-merging witnesses,
 then restarts an exact **forward motion-support BFS** from the original
 deduplicated support if greedy merging cannot finish. This happens inside the
-existing Planning stage, in both `plan_sync` and `plan_sync_uncached`. The
+existing Planning stage, in `plan_sync`, `plan_sync_uncached`, and (since
+v0.5.2) `plan_sync_allowed`. The
 preparation and monitor lifecycle, procedure signatures, and result fields
 stay the same.
 
@@ -281,7 +289,7 @@ stay the same.
 | --- | --- |
 | `ALREADY_SATISFIED` | The original support is already a singleton. The empty word and final state are valid. |
 | `PLAN` | Replaying the returned word from the original support reaches one physical state. `PAIR_MERGE` identifies a fast-path success and `SUBSET_BFS` an exact fallback success. |
-| `NO_PLAN` | Exact reachable-support exhaustion proves that no synchronizing word exists from the original support using the model's action alphabet. |
+| `NO_PLAN` | Exact reachable-support exhaustion proves that no synchronizing word exists from the original support using the query's permitted alphabet (the full model alphabet for unrestricted calls). |
 | `RESOURCE_BOUND` | The search still has work pending when its expansion budget runs out. Increasing the budget can resolve this outcome. |
 
 `status = "OK"` means the API operation completed; callers must inspect
@@ -320,6 +328,7 @@ stateDiagram-v2
 
     note right of Exact
         Same positive budget for both phases.
+        Both phases respect the permitted alphabet.
         Keep equal-cardinality motion images.
         Do not filter supports by observations.
     end note
@@ -337,6 +346,58 @@ and `final_support_size` are zero, and `final_state_key` is `""`. The C API uses
 metrics. Generation, actual expansions, and elapsed time are retained. A
 discarded greedy prefix is never returned as a plan or prepended to the exact
 word. See the [exact fallback example](#exact-synchronization-example).
+
+### Restricted Actions And Goal Sets
+
+v0.5.2 adds three procedures inside the existing Planning stage:
+
+```cypher
+CALL sync.plan_sync_allowed(model, hypotheses, actions, budget)
+CALL sync.plan_disambiguate_allowed(model, hypotheses, bound, actions, budget)
+CALL sync.plan_goal(model, hypotheses, goals, actions, budget)
+```
+
+All three require a clean prepared generation. `actions` is a nonempty list of
+known `action_key` strings; list order breaks search ties and duplicate actions
+are harmless. Hypotheses and goals are nonempty sets of known state keys, with
+duplicates collapsed. Budgets must be positive, even for an already satisfied
+request. Changing a query's actions or goals does not change the model
+generation or require preparation.
+
+Restricted synchronization searches pair witnesses using only permitted
+actions, then uses the same exact fallback and outcome contract above. Neither
+phase may use an excluded action. `NO_PLAN` with one permitted alphabet says
+nothing about a request with additional actions. The budget counts accepted
+pair witnesses and expanded fallback supports; internal pair-search work is
+not separately charged.
+
+Restricted disambiguation uses prepared pair records for its heuristic. If
+that word contains an excluded action, it is discarded and `PARTITION_BFS`
+searches the permitted alphabet. It retains the requested worst-branch bound
+and the caller-controlled policy of trying `bound=1`, then `|H|-1` after a
+proven absence. The planner never relaxes that bound automatically.
+
+Goal search asks for **containment**, `delta(H, word) subset_of goals`. Every
+possible final state must lie in the supplied set; multiple physical states
+may remain. It uses forward motion-support BFS, reports `BELIEF_BFS` on
+`PLAN`, and independently replays the returned word. It does not condition on
+observations, widen the goal set, or construct an adaptive policy. Use a
+singleton goal set when one specific final state is required.
+
+One goal-search expansion is one non-goal support expanded. Initial containment
+returns `ALREADY_SATISFIED`, an empty word, `method=NONE`, and zero expansions.
+`NO_PLAN` requires frontier exhaustion; a pending frontier at the budget limit
+returns `RESOURCE_BOUND`. Goal results include `final_state_keys` and
+`final_support_size`; both are empty/zero on failure. Success can occur on the
+last permitted expansion. Explicit search may require exponential time and
+memory. In C, `final_state` is populated only for a successful singleton image.
+
+These plans use the same explanation and observation-aware monitor lifecycle.
+Save the original support and entire word, accumulate committed outputs, and
+handle `WAIT`, `REPLAN`, `MODEL_VIOLATION`, and `STALE_GENERATION` as usual. The
+monitor checks evidence against the word; the caller retains action permissions,
+goals, and its completion policy. See the
+[runnable restricted/goal example](#restricted-and-goal-example).
 
 ### Incremental Updates
 
@@ -381,7 +442,8 @@ calls.
 For the same generation, hypotheses, bound, and budget, cached and uncached
 semantic fields are identical.
 
-All four planner procedures additionally return:
+The four unrestricted planner procedures return the following metrics.
+`plan_disambiguate_allowed` uses the same cached values:
 
 | Field | Cached value | Uncached value | Meaning |
 | --- | --- | --- | --- |
@@ -399,6 +461,12 @@ All four planner procedures additionally return:
 `planning_time_us` covers only the word planner. `total_compute_time_us` covers
 model extraction through planner completion, excluding result encoding, Bolt
 transport, and client latency.
+
+`plan_sync_allowed` and `plan_goal` read the prepared automaton directly and
+search without loading or building a pair oracle. They report
+`oracle_source: "NONE"`, `cache_state: "BYPASSED"`, zero oracle/snapshot work
+counters and times, and measured `planning_time_us` and `total_compute_time_us`.
+Their preparation requirement still applies.
 
 After upgrading from a release whose pair records lack `oracle_epoch`, run
 `prepare_model` again.
@@ -434,7 +502,7 @@ this fallback automatically.
 
 Planner calls return an `outcome` of `PLAN`, `ALREADY_SATISFIED`, `NO_PLAN`, or
 `RESOURCE_BOUND`, and a `method` of `PAIR_MERGE`, `SUBSET_BFS`, `PAIR_RESOLUTION`,
-`PARTITION_BFS`, or `NONE`. Explanation and monitoring retain the prepared-model
+`PARTITION_BFS`, `BELIEF_BFS`, or `NONE`. Explanation and monitoring retain the prepared-model
 lifecycle even when a word was obtained through the uncached API.
 
 The public C API is in `include/sync_kgraph/sync.h`. It exposes the same
@@ -993,6 +1061,28 @@ the discarded greedy witness. The remaining three expand `H`, `{q3, q4}`, and
 `{q5, q6}`. The fourth total expansion can therefore either find the singleton
 or finish the absence proof. Retrying an inconclusive call starts a new search
 with the supplied total budget; search progress is not persisted.
+
+### Restricted And Goal Example
+
+After loading and preparing the exact-sync fixtures above, run:
+
+```sh
+mgconsole --no_history < examples/exact_sync/02_restricted_and_goal.cypher
+```
+
+The queries use `sync_fallback_positive` and original support `{q0,q1,q2}`:
+
+| Request | Actions | Budget | Outcome / method | Word | Final support |
+| --- | --- | --- | --- | --- | --- |
+| Restricted sync | `a,b,c` | 4 | `PLAN / SUBSET_BFS` | `bc` | `{q3}` |
+| Restricted sync | `a,b` | 4 | `NO_PLAN / NONE` | empty | empty |
+| Restricted homing, bound 1 | `b,c` | 2 | `PLAN / PARTITION_BFS` | `bc` | worst branch size 1 |
+| Goal `{q3}` | `a,b,c` | 3 | `PLAN / BELIEF_BFS` | `bc` | `{q3}` |
+| Goal `{q3,q4}` | `a,b,c` | 1 | `PLAN / BELIEF_BFS` | `a` | `{q3,q4}` |
+
+The last goal request allows two final physical states because both are goals.
+The example also validates the committed `b`/`quiet` event with reported
+support `{q5,q6}`, receiving `CONTINUE` through the existing monitor API.
 
 ## Developer Documentation
 

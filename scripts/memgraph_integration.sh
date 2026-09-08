@@ -93,7 +93,7 @@ CALL mg.procedures() YIELD name
 WITH name
 WHERE name STARTS WITH "sync."
 WITH count(name) AS procedures
-RETURN CASE WHEN procedures = 10 THEN "PASS" ELSE "FAIL" END AS result;'
+RETURN CASE WHEN procedures = 13 THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "uncached synchronization before preparation" '
 CALL sync.plan_sync_uncached(
@@ -769,8 +769,16 @@ RETURN CASE WHEN m.generation = 5 AND m.prepared_generation = 5
 
 run_file "$root/examples/exact_sync/00_reset_and_load.cypher" >/dev/null
 
-for procedure in plan_sync_uncached plan_sync; do
+expect_failure "restricted sync requires preparation" '
+CALL sync.plan_sync_allowed("sync_fallback_positive", ["q0", "q1", "q2"], ["a", "b", "c"], 4)
+YIELD outcome RETURN outcome;'
+expect_failure "goal search requires preparation" '
+CALL sync.plan_goal("sync_fallback_positive", ["q0", "q1", "q2"], ["q3"], ["a", "b", "c"], 3)
+YIELD outcome RETURN outcome;'
+
+for procedure in plan_sync_uncached plan_sync plan_sync_allowed; do
   source="RECOMPUTED"
+  actions_arg=""
   if [ "$procedure" = "plan_sync" ]; then
     source="PERSISTED"
     for fixture in sync_fallback_positive sync_fallback_negative; do
@@ -780,9 +788,13 @@ RETURN CASE WHEN status = \"OK\" AND generation = 1
             THEN \"PASS\" ELSE \"FAIL\" END AS result;"
     done
   fi
+  if [ "$procedure" = "plan_sync_allowed" ]; then
+    source="NONE"
+    actions_arg='["a", "b", "c"], '
+  fi
 
   assert_pass "$procedure exact fallback" "
-CALL sync.$procedure(\"sync_fallback_positive\", [\"q0\", \"q1\", \"q2\"], 4)
+CALL sync.$procedure(\"sync_fallback_positive\", [\"q0\", \"q1\", \"q2\"], ${actions_arg}4)
 YIELD status, outcome, method, word, length, final_state_key,
       final_support_size, expansions, generation, oracle_source
 RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
@@ -792,7 +804,7 @@ RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
             THEN \"PASS\" ELSE \"FAIL\" END AS result;"
 
   assert_pass "$procedure exhaustive negative" "
-CALL sync.$procedure(\"sync_fallback_negative\", [\"q0\", \"q1\", \"q2\"], 4)
+CALL sync.$procedure(\"sync_fallback_negative\", [\"q0\", \"q1\", \"q2\"], ${actions_arg}4)
 YIELD status, outcome, method, word, length, final_state_key,
       final_support_size, expansions, generation, oracle_source
 RETURN CASE WHEN status = \"OK\" AND outcome = \"NO_PLAN\"
@@ -804,7 +816,7 @@ RETURN CASE WHEN status = \"OK\" AND outcome = \"NO_PLAN\"
   assert_pass "$procedure shared budget discards greedy prefix" "
 UNWIND [\"sync_fallback_positive\", \"sync_fallback_negative\"] AS model
 UNWIND [1, 2, 3] AS budget
-CALL sync.$procedure(model, [\"q0\", \"q1\", \"q2\"], budget)
+CALL sync.$procedure(model, [\"q0\", \"q1\", \"q2\"], ${actions_arg}budget)
 YIELD status, outcome, method, word, length, final_state_key,
       final_support_size, expansions, generation, oracle_source
 WITH collect(status = \"OK\" AND outcome = \"RESOURCE_BOUND\"
@@ -816,6 +828,86 @@ RETURN CASE WHEN size(checks) = 6 AND all(ok IN checks WHERE ok)
             THEN \"PASS\" ELSE \"FAIL\" END AS result;"
 done
 
+assert_pass "restricted sync uses no oracle and reports actual compute time" '
+CALL sync.plan_sync_allowed("sync_fallback_positive", ["q0", "q1", "q2"], ["a", "b"], 4)
+YIELD status, outcome, word, oracle_source, oracle_builds, cache_state,
+      snapshot_record_reads, oracle_rows_loaded, oracle_time_us, snapshot_hydration_time_us,
+      planning_time_us, total_compute_time_us
+RETURN CASE WHEN status = "OK" AND outcome = "NO_PLAN" AND word = []
+                 AND oracle_source = "NONE" AND cache_state = "BYPASSED"
+                 AND oracle_builds = 0 AND snapshot_record_reads = 0 AND oracle_rows_loaded = 0
+                 AND oracle_time_us = 0 AND snapshot_hydration_time_us = 0
+                 AND total_compute_time_us >= planning_time_us AND total_compute_time_us > 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "restricted disambiguation skips forbidden heuristic" '
+CALL sync.plan_disambiguate_allowed("sync_fallback_positive", ["q0", "q1", "q2"], 1, ["b", "c"], 2)
+YIELD status, outcome, method, word, worst_support_size, homing, expansions, generation, oracle_source
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN" AND method = "PARTITION_BFS"
+                 AND word = ["b", "c"] AND worst_support_size = 1 AND homing
+                 AND expansions = 2 AND generation = 1 AND oracle_source = "PERSISTED"
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "restricted disambiguation keeps requested bound" '
+CALL sync.plan_disambiguate_allowed("sync_fallback_positive", ["q0", "q1", "q2"], 1, ["a", "b"], 4)
+YIELD status, outcome, method, word, expansions
+RETURN CASE WHEN status = "OK" AND outcome = "NO_PLAN" AND method = "NONE"
+                 AND word = [] AND expansions = 4
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "restricted disambiguation allows explicit weaker bound" '
+CALL sync.plan_disambiguate_allowed("sync_fallback_positive", ["q0", "q1", "q2"], 2, ["a", "b"], 1)
+YIELD status, outcome, word, worst_support_size, homing
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN" AND word = ["a"]
+                 AND worst_support_size = 2 AND NOT homing
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "goal search outcomes and restricted alphabet" '
+UNWIND [
+  {model: "sync_fallback_positive", actions: ["a", "b", "c"], budget: 3, outcome: "PLAN", method: "BELIEF_BFS", word: ["b", "c"], final: ["q3"]},
+  {model: "sync_fallback_positive", actions: ["a", "b", "c"], budget: 2, outcome: "RESOURCE_BOUND", method: "NONE", word: [], final: []},
+  {model: "sync_fallback_negative", actions: ["a", "b", "c"], budget: 3, outcome: "NO_PLAN", method: "NONE", word: [], final: []},
+  {model: "sync_fallback_positive", actions: ["a", "b"], budget: 3, outcome: "NO_PLAN", method: "NONE", word: [], final: []}
+] AS expected
+CALL sync.plan_goal(expected.model, ["q0", "q1", "q2"], ["q3"], expected.actions, expected.budget)
+YIELD status, outcome, method, word, final_state_keys, final_support_size, expansions,
+      generation, oracle_source, cache_state, oracle_builds, snapshot_record_reads,
+      planning_time_us, total_compute_time_us
+WITH collect(status = "OK" AND outcome = expected.outcome AND method = expected.method
+             AND word = expected.word AND final_state_keys = expected.final
+             AND final_support_size = size(expected.final) AND expansions = expected.budget
+             AND generation = 1 AND oracle_source = "NONE" AND cache_state = "BYPASSED"
+             AND oracle_builds = 0 AND snapshot_record_reads = 0
+             AND total_compute_time_us >= planning_time_us AND total_compute_time_us > 0) AS checks
+RETURN CASE WHEN size(checks) = 4 AND all(ok IN checks WHERE ok)
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "goal containment can retain multiple physical states" '
+CALL sync.plan_goal("sync_fallback_positive", ["q0", "q1", "q2"], ["q3", "q4"], ["a", "b", "c"], 1)
+YIELD status, outcome, method, word, final_state_keys, final_support_size, expansions
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN" AND method = "BELIEF_BFS"
+                 AND word = ["a"] AND final_state_keys = ["q3", "q4"]
+                 AND final_support_size = 2 AND expansions = 1
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "goal already satisfied after deduplication" '
+CALL sync.plan_goal("sync_fallback_positive", ["q3", "q4", "q3"], ["q3", "q4", "q4"], ["a"], 1)
+YIELD status, outcome, method, word, final_state_keys, final_support_size, expansions
+RETURN CASE WHEN status = "OK" AND outcome = "ALREADY_SATISFIED" AND method = "NONE"
+                 AND word = [] AND final_state_keys = ["q3", "q4"]
+                 AND final_support_size = 2 AND expansions = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+expect_failure "restricted sync rejects empty actions" '
+CALL sync.plan_sync_allowed("sync_fallback_positive", ["q0"], [], 1) YIELD outcome RETURN outcome;'
+expect_failure "restricted disambiguation rejects unknown actions after parsing hypotheses" '
+CALL sync.plan_disambiguate_allowed("sync_fallback_positive", ["q0", "q1"], 1, ["missing"], 4)
+YIELD outcome RETURN outcome;'
+expect_failure "goal rejects unknown goal key" '
+CALL sync.plan_goal("sync_fallback_positive", ["q0"], ["missing"], ["a"], 4) YIELD outcome RETURN outcome;'
+expect_failure "goal rejects zero budget" '
+CALL sync.plan_goal("sync_fallback_positive", ["q0"], ["q3"], ["a"], 0) YIELD outcome RETURN outcome;'
+
 assert_pass "exact search leaves prepared generations unchanged" '
 MATCH (m:SyncModel)
 WHERE m.model IN ["sync_fallback_positive", "sync_fallback_negative"]
@@ -824,5 +916,26 @@ RETURN CASE WHEN size(checks) = 2 AND all(ok IN checks WHERE ok)
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 run_file "$root/examples/exact_sync/01_plan.cypher" >/dev/null
+run_file "$root/examples/exact_sync/02_restricted_and_goal.cypher" >/dev/null
+
+run_query 'CALL sync.mark_dirty("sync_fallback_positive") YIELD generation RETURN generation;' >/dev/null
+expect_failure "restricted planner rejects dirty generation" '
+CALL sync.plan_sync_allowed("sync_fallback_positive", ["q0", "q1", "q2"], ["a", "b", "c"], 4)
+YIELD outcome RETURN outcome;'
+expect_failure "goal planner rejects dirty generation" '
+CALL sync.plan_goal("sync_fallback_positive", ["q0", "q1", "q2"], ["q3"], ["a", "b", "c"], 3)
+YIELD outcome RETURN outcome;'
+assert_pass "restricted plans use the same stale-generation monitor lifecycle" '
+CALL sync.validate_observed_update("sync_fallback_positive", 1, ["q0", "q1", "q2"],
+  ["b", "c"], 1, ["quiet"], [], false)
+YIELD decision, generation
+RETURN CASE WHEN decision = "STALE_GENERATION" AND generation = 2
+            THEN "PASS" ELSE "FAIL" END AS result;'
+run_query 'CALL sync.prepare_model("sync_fallback_positive", false, false) YIELD generation RETURN generation;' >/dev/null
+assert_pass "restricted replanning adopts the current generation" '
+CALL sync.plan_sync_allowed("sync_fallback_positive", ["q0", "q1", "q2"], ["a", "b", "c"], 4)
+YIELD outcome, word, generation
+RETURN CASE WHEN outcome = "PLAN" AND word = ["b", "c"] AND generation = 2
+            THEN "PASS" ELSE "FAIL" END AS result;'
 
 echo "Memgraph integration test passed"

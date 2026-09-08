@@ -117,6 +117,8 @@ const char *sg_plan_method_name(sg_plan_method method) {
     return "PARTITION_BFS";
   case SG_METHOD_SUBSET_BFS:
     return "SUBSET_BFS";
+  case SG_METHOD_BELIEF_BFS:
+    return "BELIEF_BFS";
   }
   return "UNKNOWN";
 }

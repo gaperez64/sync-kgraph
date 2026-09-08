@@ -53,6 +53,7 @@ typedef enum {
 typedef enum {
   ORACLE_SOURCE_PERSISTED = 0,
   ORACLE_SOURCE_RECOMPUTED,
+  ORACLE_SOURCE_NONE,
 } oracle_source;
 
 typedef enum {
@@ -144,6 +145,8 @@ static const char *oracle_source_name(oracle_source source) {
     return "PERSISTED";
   case ORACLE_SOURCE_RECOMPUTED:
     return "RECOMPUTED";
+  case ORACLE_SOURCE_NONE:
+    return "NONE";
   }
   return "UNKNOWN";
 }
@@ -2148,16 +2151,11 @@ static void plan_sync_uncached_cb(struct mgp_list *arguments, struct mgp_graph *
   plan_sync_impl(arguments, graph, result, memory, ORACLE_SOURCE_RECOMPUTED);
 }
 
-/* Action-restricted planning and goal planning.
- *
- * Additive: upstream's plan_sync, plan_disambiguate and their _uncached
- * variants keep their names, arguments and behaviour. These three procedures
- * are what a robot needs - a word it can only build from letters it can
- * actually execute, and somewhere to go. Both restricted planners are
- * automaton-only, so they load the prepared automaton and never pay for a
- * pair oracle or a snapshot. */
+/* Restricted synchronization and goal search use the prepared automaton
+ * directly. Restricted disambiguation uses the prepared pair snapshot. */
 static void plan_sync_allowed_cb(struct mgp_list *arguments, struct mgp_graph *graph,
                                  struct mgp_result *result, struct mgp_memory *memory) {
+  const uint64_t total_start = monotonic_time_us();
   const char *model = NULL;
   int64_t budget = 0;
   if (!get_string_arg(arguments, 0U, &model) || !get_int_arg(arguments, 3U, &budget) ||
@@ -2183,9 +2181,10 @@ static void plan_sync_allowed_cb(struct mgp_list *arguments, struct mgp_graph *g
     return;
   }
   sg_plan_result plan = {0};
-  planning_metrics metrics = {.source = ORACLE_SOURCE_PERSISTED, .cache = CACHE_STATE_BYPASSED};
+  planning_metrics metrics = {.source = ORACLE_SOURCE_NONE, .cache = CACHE_STATE_BYPASSED};
   const sg_status status = sg_plan_sync_allowed(automaton, hypotheses, hypothesis_count, actions,
                                                 action_count, (size_t)budget, &plan);
+  metrics.total_compute_time_us = elapsed_us(total_start);
   free(hypotheses);
   free(actions);
   if (status != SG_OK) {
@@ -2210,6 +2209,7 @@ static void plan_sync_allowed_cb(struct mgp_list *arguments, struct mgp_graph *g
 
 static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
                          struct mgp_result *result, struct mgp_memory *memory) {
+  const uint64_t total_start = monotonic_time_us();
   const char *model = NULL;
   int64_t budget = 0;
   if (!get_string_arg(arguments, 0U, &model) || !get_int_arg(arguments, 4U, &budget) ||
@@ -2239,9 +2239,10 @@ static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
     return;
   }
   sg_plan_result plan = {0};
-  planning_metrics metrics = {.source = ORACLE_SOURCE_PERSISTED, .cache = CACHE_STATE_BYPASSED};
+  planning_metrics metrics = {.source = ORACLE_SOURCE_NONE, .cache = CACHE_STATE_BYPASSED};
   const sg_status status = sg_plan_goal(automaton, hypotheses, hypothesis_count, goals, goal_count,
                                         actions, action_count, (size_t)budget, &plan);
+  metrics.total_compute_time_us = elapsed_us(total_start);
   if (status != SG_OK) {
     set_status_error(result, "goal planning failed", status);
   } else {
@@ -2317,6 +2318,7 @@ static void plan_disambiguate_impl(struct mgp_list *arguments, struct mgp_graph 
   if (!argument_to_ids(automaton, arguments, 1U, false, false, &hypotheses, &hypothesis_count) ||
       (restricted &&
        !argument_to_ids(automaton, arguments, 3U, true, false, &actions, &action_count))) {
+    free(hypotheses);
     free(actions);
     set_error(result, "hypotheses or actions contain unknown prepared keys");
     sg_pair_oracle_free(oracle);

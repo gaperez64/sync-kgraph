@@ -823,6 +823,7 @@ static sg_status sg_subset_reconstruct(const sg_subset_search *search, size_t pa
 }
 
 static sg_status sg_subset_bfs(const sg_automaton *automaton, const sg_bitset *initial,
+                               const size_t *allowed_actions, size_t allowed_action_count,
                                size_t budget, sg_plan_result *result) {
   if (result->expansions >= budget) {
     result->outcome = SG_OUTCOME_RESOURCE_BOUND;
@@ -847,7 +848,10 @@ static sg_status sg_subset_bfs(const sg_automaton *automaton, const sg_bitset *i
     const size_t parent = head;
     ++head;
     ++result->expansions;
-    for (size_t action = 0U; action < automaton->action_count; ++action) {
+    const size_t action_count =
+        allowed_actions == NULL ? automaton->action_count : allowed_action_count;
+    for (size_t letter = 0U; letter < action_count; ++letter) {
+      const size_t action = allowed_actions == NULL ? letter : allowed_actions[letter];
       /* Reacquire the parent by index: adding a node can reallocate the queue. */
       sg_apply_action_set(automaton, &search.nodes[parent].support, action, &next);
       if (sg_bitset_count(&next) == 1U) {
@@ -947,7 +951,7 @@ static sg_status sg_plan_sync_with_source(const sg_automaton *automaton,
       /* A greedy dead end says nothing about other words from the original H.
        * Discard its word, but retain its expansions within the one total budget. */
       sg_sync_discard_plan(result);
-      status = sg_subset_bfs(automaton, &initial, budget, result);
+      status = sg_subset_bfs(automaton, &initial, NULL, 0U, budget, result);
     }
     if (status == SG_OK && result->outcome == SG_OUTCOME_PLAN) {
       status = sg_sync_finalize(automaton, &initial, result);
@@ -983,16 +987,22 @@ sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *orac
                                   result);
 }
 
-/* Action-restricted synchronization and goal planning.
- *
- * Ported onto 0.4.0 as strictly additive code: upstream's sg_plan_sync,
- * sg_plan_disambiguate and their _from_records variants keep their names,
- * signatures and behaviour. The restricted planners take the pair oracle
- * directly rather than a sg_pair_record_source, because a merge word that may
- * only use a subset of the alphabet cannot be read off the precomputed
- * merge_action in a pair record - that action may be one the caller forbade -
- * so it is searched here over the oracle's own pair-transition table.
- */
+/* Restricted witnesses are searched on the automaton: a persisted witness
+ * for the full alphabet may contain an excluded action. Both synchronization
+ * paths use the same exact fallback and public outcome contract. */
+
+static bool sg_allowed_actions_valid(const sg_automaton *automaton, const size_t *allowed_actions,
+                                     size_t allowed_action_count) {
+  if (automaton == NULL || allowed_actions == NULL || allowed_action_count == 0U) {
+    return false;
+  }
+  for (size_t index = 0U; index < allowed_action_count; ++index) {
+    if (allowed_actions[index] >= automaton->action_count) {
+      return false;
+    }
+  }
+  return true;
+}
 
 static sg_status sg_allowed_merge_word(const sg_automaton *automaton, size_t first, size_t second,
                                        const size_t *allowed_actions, size_t allowed_action_count,
@@ -1154,14 +1164,9 @@ static sg_status sg_best_merge_allowed(const sg_automaton *automaton, const sg_b
 sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *initial_states,
                                size_t initial_count, const size_t *allowed_actions,
                                size_t allowed_action_count, size_t budget, sg_plan_result *result) {
-  if (automaton == NULL || initial_states == NULL || initial_count == 0U ||
-      allowed_actions == NULL || allowed_action_count == 0U || budget == 0U || result == NULL) {
+  if (!sg_allowed_actions_valid(automaton, allowed_actions, allowed_action_count) ||
+      initial_states == NULL || initial_count == 0U || budget == 0U || result == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
-  }
-  for (size_t index = 0U; index < allowed_action_count; ++index) {
-    if (allowed_actions[index] >= automaton->action_count) {
-      return SG_ERR_INVALID_ARGUMENT;
-    }
   }
   const uint64_t start = sg_monotonic_time_us();
   sg_status status = sg_plan_result_init(automaton, result);
@@ -1194,7 +1199,8 @@ sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *init
     status = sg_best_merge_allowed(automaton, &active, allowed_actions, allowed_action_count,
                                    &witness, &next);
     if (status == SG_ERR_NOT_FOUND) {
-      result->outcome = SG_OUTCOME_NO_PLAN;
+      sg_word_free(&witness);
+      sg_bitset_free(&next);
       status = SG_OK;
       break;
     }
@@ -1210,11 +1216,18 @@ sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *init
       sg_bitset_free(&next);
     }
   }
-  if (status == SG_OK && result->outcome != SG_OUTCOME_ALREADY_SATISFIED &&
-      sg_bitset_count(&active) == 1U) {
-    result->outcome = SG_OUTCOME_PLAN;
-    result->method = SG_METHOD_PAIR_MERGE;
-    status = sg_sync_finalize(automaton, &initial, result);
+  if (status == SG_OK && result->outcome != SG_OUTCOME_ALREADY_SATISFIED) {
+    if (sg_bitset_count(&active) == 1U) {
+      result->outcome = SG_OUTCOME_PLAN;
+      result->method = SG_METHOD_PAIR_MERGE;
+    } else {
+      sg_sync_discard_plan(result);
+      status =
+          sg_subset_bfs(automaton, &initial, allowed_actions, allowed_action_count, budget, result);
+    }
+    if (status == SG_OK && result->outcome == SG_OUTCOME_PLAN) {
+      status = sg_sync_finalize(automaton, &initial, result);
+    }
   }
   result->planning_time_us = sg_elapsed_us(start);
   sg_bitset_free(&initial);
@@ -1225,14 +1238,8 @@ sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *init
   return status;
 }
 
-/* Goal-directed planning over beliefs.
- *
- * Deliberately independent of the pair oracle: reaching a goal set is a
- * reachability question about supports, not about distinguishing states, so
- * this is a BFS over belief supports under the allowed alphabet. That is also
- * why it survived the 0.4.0 refactor untouched - it never used the machinery
- * upstream reshaped.
- */
+/* Goal search uses motion supports and succeeds when the whole support is
+ * contained in the supplied goal set. It need not reach a single state. */
 
 static void sg_belief_search_free(sg_belief_search *search) {
   if (search == NULL) {
@@ -1325,15 +1332,10 @@ sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_stat
                        size_t initial_count, const size_t *goal_states, size_t goal_count,
                        const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
                        sg_plan_result *result) {
-  if (automaton == NULL || initial_states == NULL || initial_count == 0U || goal_states == NULL ||
-      goal_count == 0U || allowed_actions == NULL || allowed_action_count == 0U || budget == 0U ||
-      result == NULL) {
+  if (!sg_allowed_actions_valid(automaton, allowed_actions, allowed_action_count) ||
+      initial_states == NULL || initial_count == 0U || goal_states == NULL || goal_count == 0U ||
+      budget == 0U || result == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
-  }
-  for (size_t index = 0U; index < allowed_action_count; ++index) {
-    if (allowed_actions[index] >= automaton->action_count) {
-      return SG_ERR_INVALID_ARGUMENT;
-    }
   }
 
   const uint64_t start = sg_monotonic_time_us();
@@ -1355,7 +1357,6 @@ sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_stat
 
   if (sg_bitset_subset(&initial, &goals)) {
     result->outcome = SG_OUTCOME_ALREADY_SATISFIED;
-    result->method = SG_METHOD_BELIEF_BFS;
     status = sg_goal_finalize(automaton, &initial, &goals, result);
   } else {
     sg_belief_search search = {0};
@@ -1433,7 +1434,9 @@ static bool sg_resolution_candidate_better(size_t worst, size_t length, size_t b
 static sg_status sg_best_resolution(const sg_automaton *automaton,
                                     const sg_pair_record_source *record_source,
                                     const sg_bitset *initial, size_t current_worst,
-                                    sg_word *best_word, sg_trace_partition *best_partition) {
+                                    sg_word *best_word, sg_trace_partition *best_partition,
+                                    bool *found) {
+  *found = false;
   sg_trace_partition source = {0};
   sg_status status = sg_trace_partition_init(initial, &source);
   if (status != SG_OK) {
@@ -1443,7 +1446,7 @@ static sg_status sg_best_resolution(const sg_automaton *automaton,
   size_t product = 0U;
   if (initial_count < 2U || !sg_size_multiply(initial_count, initial_count - 1U, &product)) {
     sg_trace_partition_free(&source);
-    return initial_count < 2U ? SG_ERR_NOT_FOUND : SG_ERR_ALLOC;
+    return initial_count < 2U ? SG_OK : SG_ERR_ALLOC;
   }
   const size_t candidate_count = product / 2U;
   size_t *first_states = calloc(candidate_count, sizeof(*first_states));
@@ -1526,7 +1529,12 @@ static sg_status sg_best_resolution(const sg_automaton *automaton,
     sg_trace_partition_free(best_partition);
     return status;
   }
-  return best_pair != SG_INDEX_NONE && best_worst < current_worst ? SG_OK : SG_ERR_NOT_FOUND;
+  *found = best_pair != SG_INDEX_NONE && best_worst < current_worst;
+  if (!*found) {
+    sg_word_free(best_word);
+    sg_trace_partition_free(best_partition);
+  }
+  return SG_OK;
 }
 
 static void sg_support_partition_free(sg_support_partition *partition) {
@@ -1825,9 +1833,10 @@ sg_plan_disambiguate_with_source(const sg_automaton *automaton, const sg_pair_re
   } else {
     sg_word heuristic = {0};
     sg_trace_partition heuristic_partition = {0};
+    bool found = false;
     status = sg_best_resolution(automaton, source, &initial, unique_count, &heuristic,
-                                &heuristic_partition);
-    if (status == SG_OK && allowed_actions != NULL) {
+                                &heuristic_partition, &found);
+    if (status == SG_OK && found && allowed_actions != NULL) {
       /* The heuristic word is assembled from precomputed pair records, which
        * know nothing about the caller's alphabet. A single forbidden letter
        * makes the whole word unexecutable, so fall through to the bounded
@@ -1845,12 +1854,12 @@ sg_plan_disambiguate_with_source(const sg_automaton *automaton, const sg_pair_re
           sg_trace_partition_free(&heuristic_partition);
           heuristic = (sg_word){0};
           heuristic_partition = (sg_trace_partition){0};
-          status = SG_ERR_NOT_FOUND;
+          found = false;
           break;
         }
       }
     }
-    if (status == SG_OK) {
+    if (status == SG_OK && found) {
       size_t best = 0U;
       size_t worst = 0U;
       size_t total = 0U;
@@ -1863,11 +1872,11 @@ sg_plan_disambiguate_with_source(const sg_automaton *automaton, const sg_pair_re
         status = sg_disambiguation_finalize(automaton, &initial, bound, result);
       } else {
         sg_word_free(&heuristic);
-        status = SG_ERR_NOT_FOUND;
+        found = false;
       }
     }
     sg_trace_partition_free(&heuristic_partition);
-    if (status == SG_ERR_NOT_FOUND) {
+    if (status == SG_OK && !found) {
       status = sg_partition_bfs(automaton, &initial, bound, allowed_actions, allowed_action_count,
                                 budget, &result->expansions, &result->word, &result->outcome);
       if (status == SG_OK && result->outcome == SG_OUTCOME_PLAN) {
@@ -1914,13 +1923,8 @@ sg_status sg_plan_disambiguate_allowed_from_records(
     const sg_automaton *automaton, const sg_pair_record_source *source,
     const size_t *initial_states, size_t initial_count, size_t bound, const size_t *allowed_actions,
     size_t allowed_action_count, size_t budget, sg_plan_result *result) {
-  if (allowed_actions == NULL || allowed_action_count == 0U) {
+  if (!sg_allowed_actions_valid(automaton, allowed_actions, allowed_action_count)) {
     return SG_ERR_INVALID_ARGUMENT;
-  }
-  for (size_t index = 0U; index < allowed_action_count; ++index) {
-    if (allowed_actions[index] >= automaton->action_count) {
-      return SG_ERR_INVALID_ARGUMENT;
-    }
   }
   return sg_plan_disambiguate_with_source(automaton, source, initial_states, initial_count, bound,
                                           allowed_actions, allowed_action_count, budget, result);
@@ -1931,14 +1935,9 @@ sg_status sg_plan_disambiguate_allowed(const sg_automaton *automaton, const sg_p
                                        size_t bound, const size_t *allowed_actions,
                                        size_t allowed_action_count, size_t budget,
                                        sg_plan_result *result) {
-  if (oracle == NULL || oracle->automaton != automaton || allowed_actions == NULL ||
-      allowed_action_count == 0U) {
+  if (!sg_allowed_actions_valid(automaton, allowed_actions, allowed_action_count) ||
+      oracle == NULL || oracle->automaton != automaton) {
     return SG_ERR_INVALID_ARGUMENT;
-  }
-  for (size_t index = 0U; index < allowed_action_count; ++index) {
-    if (allowed_actions[index] >= automaton->action_count) {
-      return SG_ERR_INVALID_ARGUMENT;
-    }
   }
   const sg_pair_record_source source = {
       .context = (void *)oracle,

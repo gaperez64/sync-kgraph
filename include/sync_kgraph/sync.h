@@ -209,9 +209,17 @@ sg_status sg_plan_disambiguate_from_records(const sg_automaton *automaton,
                                             const sg_pair_record_source *source,
                                             const size_t *initial_states, size_t initial_count,
                                             size_t bound, size_t budget, sg_plan_result *result);
+/* Restricted synchronization has the same contract as sg_plan_sync, with both
+ * pair-witness search and exact fallback limited to allowed_actions. It needs
+ * no pair oracle. Action lists must be nonempty and contain valid IDs; supplied
+ * order breaks search ties, and duplicate IDs are harmless. */
 sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *initial_states,
                                size_t initial_count, const size_t *allowed_actions,
                                size_t allowed_action_count, size_t budget, sg_plan_result *result);
+/* Restricted disambiguation keeps the requested worst-branch bound. A pair
+ * witness containing an excluded action is discarded before partition BFS
+ * searches the permitted alphabet. No automatic bound relaxation is performed.
+ * The action-list rules above apply. Record-source errors propagate unchanged. */
 sg_status sg_plan_disambiguate_allowed_from_records(
     const sg_automaton *automaton, const sg_pair_record_source *source,
     const size_t *initial_states, size_t initial_count, size_t bound, const size_t *allowed_actions,
@@ -221,6 +229,16 @@ sg_status sg_plan_disambiguate_allowed(const sg_automaton *automaton, const sg_p
                                        size_t bound, const size_t *allowed_actions,
                                        size_t allowed_action_count, size_t budget,
                                        sg_plan_result *result);
+/* Goal search finds a word whose motion image is contained in goal_states.
+ * It does not require a singleton and never conditions on observations or
+ * widens the goal set. Nonempty initial/goal/action lists and positive budget
+ * are required. The action-list rules above apply; state lists are deduplicated.
+ * BELIEF_BFS expands one non-goal support per budget unit and searches by word
+ * length. Success is independently replayed. Initial containment returns
+ * ALREADY_SATISFIED with method NONE. NO_PLAN proves reachable-frontier
+ * exhaustion; RESOURCE_BOUND is inconclusive. Failed words and metrics are
+ * empty/zero as in synchronization; final_state is SG_INDEX_NONE unless the
+ * successful final support is a singleton. */
 sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_states,
                        size_t initial_count, const size_t *goal_states, size_t goal_count,
                        const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
